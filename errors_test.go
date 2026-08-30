@@ -479,13 +479,21 @@ func TestOpenerFailures(t *testing.T) {
 	})
 }
 
-// TestBadShapedOpenersFallBack: a driver whose OpenFile has the wrong shape
-// must be read through ReadFile, not called.
-func TestBadShapedOpenersFallBack(t *testing.T) {
+// TestNonInterfaceOpenersFallBack: a driver with a method NAMED OpenFile that
+// is not filesystem.Opener must be read through ReadFile, not called.
+//
+// The first case is the one that documents the rule. foreignOpener has the
+// right name, the right arity, the right semantics and a result type that is
+// structurally identical to filesystem.File — and it is a different named
+// type, so Go does not consider the interface satisfied. Its OpenFile serves
+// bytes that are deliberately NOT the file's, so if the server ever matched by
+// structure again this test would fail on content rather than on a nil check.
+func TestNonInterfaceOpenersFallBack(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		fs   filesystem.Filesystem
 	}{
+		{"a structurally identical but distinct File type", &foreignOpener{memFS: fixture()}},
 		{"extra argument", &badOpener{memFS: fixture()}},
 		{"wrong result type", &wrongResultOpener{memFS: fixture()}},
 		{"argument is not a path", &notStringOpener{memFS: fixture()}},

@@ -277,18 +277,21 @@ func (nopFS) DeleteFile(string) error                     { return nil }
 func (nopFS) DeleteDir(string) error                      { return nil }
 func (nopFS) Rename(string, string) error                 { return nil }
 
+// probeNamed returns a *named interface distinct from filesystem.File* with
+// the very same method set. Go compares method sets by type identity, so this
+// is NOT filesystem.Opener, and the probe must say so.
 type probeNamed struct{ nopFS }
 
-// OpenFile returns a *named interface distinct from nfs.File*, exactly as the
-// real interface module's Opener does. A type assertion would miss it; the
-// reflection probe must not.
 func (probeNamed) OpenFile(p string) (probeFile, error) { return nil, nil }
 
+// probeNative is the real thing: OpenFile returning filesystem.File.
 type probeNative struct{ nopFS }
 
 func (probeNative) OpenFile(p string) (File, error) { return nil, nil }
 
-type probeNilFile struct{ probeNamed }
+type probeNilFile struct{ nopFS }
+
+func (probeNilFile) OpenFile(p string) (File, error) { return nil, nil }
 
 type probeArity struct{ nopFS }
 
@@ -314,23 +317,25 @@ type probeErr struct{ nopFS }
 
 var errProbe = errors.New("probe: open failed")
 
-func (probeErr) OpenFile(p string) (probeFile, error) { return nil, errProbe }
+func (probeErr) OpenFile(p string) (File, error) { return nil, errProbe }
 
 func TestOpenerFor(t *testing.T) {
-	t.Run("declared with a foreign File type", func(t *testing.T) {
-		if openerFor(probeNamed{}) == nil {
-			t.Fatal("the probe missed an OpenFile returning a differently-named File")
-		}
-	})
-	t.Run("declared with this module's File", func(t *testing.T) {
+	t.Run("declared with the interface module's File", func(t *testing.T) {
 		if openerFor(probeNative{}) == nil {
-			t.Fatal("the probe missed a native Opener")
+			t.Fatal("the probe missed a real filesystem.Opener")
 		}
 	})
+	// Every case below has a method named OpenFile and is still not the
+	// capability. The first is the one worth stating out loud: identical
+	// shape, identical semantics, different named type. Accepting it would
+	// mean matching by structure again, which is what the reflection probe
+	// this replaced had to do because the interface module had no tagged
+	// release carrying Opener.
 	for _, tc := range []struct {
 		name string
 		fs   any
 	}{
+		{"a structurally identical but distinct File type", probeNamed{}},
 		{"no OpenFile at all", nopFS{}},
 		{"wrong arity", probeArity{}},
 		{"extra argument", probeExtraArg{}},
@@ -340,19 +345,19 @@ func TestOpenerFor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if openerFor(tc.fs) != nil {
-				t.Fatal("the probe accepted a method with the wrong shape")
+				t.Fatal("the probe accepted something that is not filesystem.Opener")
 			}
 		})
 	}
 	t.Run("open error is propagated", func(t *testing.T) {
-		open := openerFor(probeErr{})
-		if _, err := open("/x"); !errors.Is(err, errProbe) {
+		e := &export{open: openerFor(probeErr{})}
+		if _, err := e.openFile("/x"); !errors.Is(err, errProbe) {
 			t.Fatalf("open error = %v, want %v", err, errProbe)
 		}
 	})
 	t.Run("a nil File with no error is refused, not dereferenced", func(t *testing.T) {
-		open := openerFor(probeNilFile{})
-		if _, err := open("/x"); !errors.Is(err, errNilFile) {
+		e := &export{open: openerFor(probeNilFile{})}
+		if _, err := e.openFile("/x"); !errors.Is(err, errNilFile) {
 			t.Fatalf("open error = %v, want errNilFile", err)
 		}
 	})

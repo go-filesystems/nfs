@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"math"
 	"os"
 	"time"
 
@@ -221,15 +222,28 @@ func (s *Server) procSetAttr(c *rpc.Call) rpc.Status {
 
 // WRITE (RFC 1813 §3.7).
 //
-// # Read-modify-write, and why
+// # Positional when the driver can, read-modify-write when it cannot
 //
-// [github.com/go-filesystems/interface.Filesystem] offers WriteFile, which
-// replaces a whole file — there is no positional write. A WRITE at a non-zero
-// offset therefore reads the file, splices the new bytes in, and writes it
-// back. That is O(filesize) per request and is documented rather than hidden:
-// writing a large file over NFS to a driver with no positional write is
-// quadratic. Sequential writes from offset 0 in wtpref-sized chunks are the
-// case that behaves, and it is the case ordinary tools produce.
+// A WRITE names an offset. Whether this server can honour it as an offset
+// depends entirely on the driver:
+//
+//   - The driver implements [github.com/go-filesystems/interface.Opener] and
+//     the [github.com/go-filesystems/interface.File] it returns is also a
+//     [github.com/go-filesystems/interface.WritableFile]: the bytes go where
+//     the client put them, and the cost is the bytes themselves.
+//   - Otherwise [github.com/go-filesystems/interface.Filesystem] offers only
+//     WriteFile, which replaces a WHOLE file. The request then costs
+//     O(filesize): read everything, splice, write everything back. A client
+//     streaming a file in wtpref-sized blocks pays that per block, so the
+//     transfer is quadratic in the file's size.
+//
+// The second path is not a theoretical cost. Against a FAT32 image with no
+// positional write, a 2 MiB sequential dd in 64 KiB blocks over a real Linux
+// kernel NFS mount took 23 s — 90 kB/s — and a soft,timeo=50 mount gave up
+// with EIO partway through, because one WRITE round-trip exceeded the
+// client's timeout. It is kept because it is the only thing a read-only-ish
+// driver can do, and because a correct slow answer beats NFS3ERR_NOTSUPP; it
+// is not kept because it is acceptable.
 func (s *Server) procWrite(c *rpc.Call) rpc.Status {
 	e, path, st, garbage := s.fhArg(c.Args)
 	if garbage {
@@ -257,6 +271,14 @@ func (s *Server) procWrite(c *rpc.Call) rpc.Status {
 		wccFail(c.Res, StatusInval, fattr{}, StatusNoEnt)
 		return rpc.StatusSuccess
 	}
+	// off is a uint64 off the wire and len(data) is bounded by writeMax, but
+	// the sum still has to be expressible as the int64 every driver offset
+	// is, or the positional path would hand a negative offset to a WriteAt.
+	// Refusing here also spares the fallback a make() of absurd size.
+	if off > math.MaxInt64-uint64(len(data)) {
+		wccFail(c.Res, StatusInval, fattr{}, StatusNoEnt)
+		return rpc.StatusSuccess
+	}
 	s.fsmu.Lock()
 	defer s.fsmu.Unlock()
 	before, beforeSt := s.attrFor(e, path)
@@ -272,20 +294,8 @@ func (s *Server) procWrite(c *rpc.Call) rpc.Status {
 		wccFail(c.Res, StatusIsDir, before, StatusOK)
 		return rpc.StatusSuccess
 	}
-	cur, err := e.fs.ReadFile(path)
-	if err != nil {
-		wccFail(c.Res, statusFor(err, StatusIO), before, StatusOK)
-		return rpc.StatusSuccess
-	}
-	end := off + uint64(len(data))
-	if end > uint64(len(cur)) {
-		grown := make([]byte, end)
-		copy(grown, cur)
-		cur = grown
-	}
-	copy(cur[off:], data)
-	if err := e.fs.WriteFile(path, cur, os.FileMode(before.mode)); err != nil {
-		wccFail(c.Res, statusFor(err, StatusIO), before, StatusOK)
+	if st := s.writeAt(e, path, off, data, os.FileMode(before.mode)); st != StatusOK {
+		wccFail(c.Res, st, before, StatusOK)
 		return rpc.StatusSuccess
 	}
 	after, afterSt := s.attrFor(e, path)
@@ -295,6 +305,74 @@ func (s *Server) procWrite(c *rpc.Call) rpc.Status {
 	c.Res.Uint32(writeFileSync)
 	c.Res.Fixed(s.writeVerf())
 	return rpc.StatusSuccess
+}
+
+// writeAt lands data at off, positionally when the driver allows it.
+//
+// The probe is on the FILE, not on the driver, and that distinction is the
+// reason this is a separate function rather than a branch inside procWrite:
+// a driver may open one file writably and hand back a plain, read-only File
+// for another — ext4 does exactly that for an inode whose body is inline or
+// mapped by the old block map rather than by extents. Falling back per file
+// keeps those files working at the slow-but-correct speed while every other
+// file on the same volume gets the fast path.
+//
+// Failure of the positional path is reported, never retried through the
+// fallback. A WriteAt that failed halfway has already changed the file, and
+// re-splicing the same request over the result would write the client's bytes
+// twice or paper over a real medium error; the client's own retry, which
+// carries the same offset and the same bytes, is the correct recovery.
+//
+// The caller must hold [Server.fsmu].
+func (s *Server) writeAt(e *export, path string, off uint64, data []byte, perm os.FileMode) Status {
+	if e.open != nil {
+		f, err := e.openFile(path)
+		if err != nil {
+			return statusFor(err, StatusIO)
+		}
+		if w, ok := f.(WritableFile); ok {
+			// Close's error matters here in a way it does not on the read
+			// path: it is a driver's last chance to report that a write it
+			// buffered could not be flushed, and swallowing it would let the
+			// server answer FILE_SYNC for bytes that never landed.
+			if _, err := w.WriteAt(data, int64(off)); err != nil {
+				f.Close()
+				return statusFor(err, StatusIO)
+			}
+			// Sync before Close, so the FILE_SYNC this server always answers
+			// with is a claim the driver has actually been asked to honour.
+			// NFSv3 §3.21 lets a server promise stability only if it can.
+			if err := w.Sync(); err != nil {
+				f.Close()
+				return statusFor(err, StatusIO)
+			}
+			if err := f.Close(); err != nil {
+				return statusFor(err, StatusIO)
+			}
+			return StatusOK
+		}
+		// Openable but not writable: fall through to read-modify-write, and
+		// release the handle first so the driver is not asked to serve a
+		// WriteFile on a path it still has open.
+		if err := f.Close(); err != nil {
+			return statusFor(err, StatusIO)
+		}
+	}
+	cur, err := e.fs.ReadFile(path)
+	if err != nil {
+		return statusFor(err, StatusIO)
+	}
+	end := off + uint64(len(data))
+	if end > uint64(len(cur)) {
+		grown := make([]byte, end)
+		copy(grown, cur)
+		cur = grown
+	}
+	copy(cur[off:], data)
+	if err := e.fs.WriteFile(path, cur, perm); err != nil {
+		return statusFor(err, StatusIO)
+	}
+	return StatusOK
 }
 
 // createReply encodes the shared tail of CREATE, MKDIR and SYMLINK.

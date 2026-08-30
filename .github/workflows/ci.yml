@@ -336,3 +336,124 @@ jobs:
 
           sudo umount /mnt/live
           echo "unmounted cleanly"
+
+  # The measurement this repository's WRITE path exists for, taken over a REAL
+  # Linux kernel NFS client rather than in process. Both arms run in the SAME
+  # job, on the same runner, against the same image geometry, and differ in
+  # exactly one flag: -no-positional hides the driver's WritableFile so the
+  # server takes the ReadFile+splice+WriteFile path it took before it had one.
+  # Anything else — two workflow runs, two commits, two machines — would
+  # measure the runner as much as the code.
+  live-write-bench:
+    name: live write benchmark (linux kernel client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: nfs
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/fat32demo/go.mod
+
+      - name: Install the NFS client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nfs-common
+
+      - name: Measure 2 MiB in 64 KiB blocks, with and without a positional write
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/bench ./mkimg
+          cat > ./mkimg/main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              fat32 "github.com/go-filesystems/fat32"
+          )
+
+          // Formats a fresh image with one empty target file. A fresh image per
+          // arm matters: a file that already has a cluster chain and one that
+          // has to allocate every cluster are different workloads, and the two
+          // arms must face the same one.
+          func main() {
+              _ = os.Remove(os.Args[1])
+              fs, err := fat32.Format(os.Args[1], 64<<20, fat32.FormatConfig{Label: "BENCH"})
+              if err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.WriteFile("/TARGET.BIN", nil, 0o644); err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.Close(); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go build -mod=mod -o /tmp/bench/mkimg ./mkimg
+          rm -rf ./mkimg
+          go build -mod=mod -o /tmp/bench/fat32demo .
+          sudo mkdir -p /mnt/bench
+
+          # One arm. $1 is the label, $2 is either empty or -no-positional.
+          #
+          # dd uses oflag=direct so that each 64 KiB block is one WRITE RPC:
+          # buffered writes would be coalesced by the page cache into wsize
+          # chunks at a time the kernel chooses, which measures the writeback
+          # heuristics rather than the server. wsize=65536 pins the block size
+          # on the wire to the 64 KiB the measurement names.
+          run_arm() {
+            label="$1"; shift
+            /tmp/bench/mkimg /tmp/bench/disk.img
+            /tmp/bench/fat32demo -image /tmp/bench/disk.img -addr 127.0.0.1:12049 -rw "$@" &
+            demo_pid=$!
+            trap 'sudo umount -f /mnt/bench 2>/dev/null || true; kill $demo_pid 2>/dev/null || true' RETURN
+            for i in $(seq 1 50); do
+              if (exec 3<>/dev/tcp/127.0.0.1/12049) 2>/dev/null; then break; fi
+              sleep 0.2
+            done
+            sudo mount -t nfs -o vers=3,tcp,port=12049,mountport=12049,nolock,hard,timeo=600,wsize=65536,rsize=65536 \
+              127.0.0.1:/ /mnt/bench
+            start=$(date +%s.%N)
+            sudo dd if=/dev/urandom of=/mnt/bench/TARGET.BIN bs=64k count=32 \
+              oflag=direct conv=notrunc status=none
+            end=$(date +%s.%N)
+            secs=$(python3 -c "print(f'{$end-$start:.2f}')")
+            rate=$(python3 -c "print(f'{2*1024*1024/($end-$start)/1000:.0f}')")
+            echo "RESULT $label: 2 MiB in 64 KiB blocks took ${secs}s (${rate} kB/s)"
+            sudo umount /mnt/bench
+            kill $demo_pid 2>/dev/null || true
+            wait $demo_pid 2>/dev/null || true
+          }
+
+          run_arm "whole-file (ReadFile+splice+WriteFile, the path before WritableFile)" -no-positional
+          run_arm "positional (filesystem.WritableFile)"
+
+      - name: A soft,timeo=50 mount must survive the write it used to fail
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          # The original defect was not only slow: a soft-mounted client GAVE
+          # UP with EIO, because one whole-file WRITE round-trip exceeded its
+          # timeout. This asserts the write now completes on the very mount
+          # options that used to break it.
+          /tmp/bench/mkimg /tmp/bench/soft.img
+          /tmp/bench/fat32demo -image /tmp/bench/soft.img -addr 127.0.0.1:12050 -rw &
+          demo_pid=$!
+          trap 'sudo umount -f /mnt/soft 2>/dev/null || true; kill $demo_pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/12050) 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          sudo mkdir -p /mnt/soft
+          sudo mount -t nfs -o vers=3,tcp,port=12050,mountport=12050,nolock,soft,timeo=50,retrans=2,wsize=65536 \
+            127.0.0.1:/ /mnt/soft
+          sudo dd if=/dev/urandom of=/mnt/soft/TARGET.BIN bs=64k count=32 \
+            oflag=direct conv=notrunc status=none
+          test "$(stat -c %s /mnt/soft/TARGET.BIN)" -eq 2097152
+          echo "soft,timeo=50 completed 2 MiB with no EIO"
+          sudo umount /mnt/soft

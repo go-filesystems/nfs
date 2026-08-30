@@ -162,14 +162,29 @@ which materialises the **entire file** for every READ — so streaming a 4 GiB
 image in 128 KiB reads costs 32768 full-file reads. Correct, but only usable
 for small files.
 
-**Writes.** `Filesystem` has `WriteFile` (whole-file replace) and no
-positional write, so a WRITE at a non-zero offset reads the file, splices, and
-writes it back: **O(filesize) per request**. Measured over a real mount, a
-2 MiB `dd` in 64 KiB blocks took **23 s (90 kB/s)** against a FAT32 image on a
-cloud disk, and a `soft,timeo=50` mount reports `EIO` partway through because
-a single WRITE round exceeds the client's 5-second timeout. Use `hard` and a
-generous `timeo` until `interface` grows a `WriteAt` — the write-side twin of
-`Opener`.
+**Writes.** A driver whose `OpenFile` returns a
+[`filesystem.WritableFile`](https://pkg.go.dev/github.com/go-filesystems/interface#WritableFile)
+— `io.WriterAt` + `Truncate` + `Sync` — is written **at the offset the client
+sent**, and the request costs the bytes it carries.
+
+A driver *without* one is written the only way `Filesystem` allows: `WriteFile`
+replaces a whole file, so a WRITE at a non-zero offset reads the file, splices,
+and writes it back, at **O(filesize) per request**. A client streaming a file
+in `wtpref`-sized blocks pays that per block, so the transfer is quadratic.
+
+Both numbers below come from the same job on the same runner, differing in one
+flag (`fat32demo -no-positional`, which hides the driver's capability), with a
+real Linux kernel NFS client writing 2 MiB in 64 KiB blocks
+(`wsize=65536`, `oflag=direct`, one WRITE RPC per block) to a FAT32 image:
+
+| write path | 2 MiB in 64 KiB blocks |
+|---|---|
+| whole-file (`ReadFile` + splice + `WriteFile`) | see the `live-write-bench` CI job |
+| positional (`filesystem.WritableFile`) | see the `live-write-bench` CI job |
+
+The original defect was not only slowness: a `soft,timeo=50` mount reported
+`EIO` partway through, because a single WRITE round-trip exceeded the client's
+timeout. That mount is now part of the same job, and must complete.
 
 **FSSTAT.** There is no statfs in the contract, so an export with no
 [`WithCapacity`](https://pkg.go.dev/github.com/go-filesystems/nfs#WithCapacity)
