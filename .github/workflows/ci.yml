@@ -336,3 +336,188 @@ jobs:
 
           sudo umount /mnt/live
           echo "unmounted cleanly"
+
+  # The measurement this repository's WRITE path exists for, taken over a REAL
+  # Linux kernel NFS client rather than in process. Both arms run in the SAME
+  # job, on the same runner, against the same image geometry, and differ in
+  # exactly one flag: -no-positional hides the driver's WritableFile so the
+  # server takes the ReadFile+splice+WriteFile path it took before it had one.
+  # Anything else — two workflow runs, two commits, two machines — would
+  # measure the runner as much as the code.
+  live-write-bench:
+    name: live write benchmark (linux kernel client)
+    runs-on: ubuntu-latest
+    # The whole-file arm is deliberately running the quadratic path, and how
+    # long that takes is a property of the runner as much as of the code: the
+    # same 8 MiB arm has taken 31 s and 69 s on different runners, and slower
+    # ones exist. A cap turns "the defect is worse here than usual" into a
+    # failed job rather than an hour of a queue.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: nfs
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/fat32demo/go.mod
+
+      - name: Install the NFS client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nfs-common
+
+      - name: Measure 2 MiB in 64 KiB blocks, with and without a positional write
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/bench ./mkimg
+          cat > ./mkimg/main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              fat32 "github.com/go-filesystems/fat32"
+          )
+
+          // Formats a fresh image with one empty target file. A fresh image per
+          // arm matters: a file that already has a cluster chain and one that
+          // has to allocate every cluster are different workloads, and the two
+          // arms must face the same one.
+          func main() {
+              _ = os.Remove(os.Args[1])
+              fs, err := fat32.Format(os.Args[1], 64<<20, fat32.FormatConfig{Label: "BENCH"})
+              if err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.WriteFile("/TARGET.BIN", nil, 0o644); err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.Close(); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go build -mod=mod -o /tmp/bench/mkimg ./mkimg
+          rm -rf ./mkimg
+          go build -mod=mod -o /tmp/bench/fat32demo .
+
+          # The ORIGINAL baseline, built from the same source with the driver
+          # pinned to fat32 v0.1.0 — the version that was in this module's
+          # go.mod when 90 kB/s was measured, and the last one with neither
+          # Opener nor WritableFile.
+          #
+          # Pinning the driver rather than only passing -no-positional matters,
+          # and getting this wrong would have produced a flattering number.
+          # fat32 v0.3.0 removed TWO quadratics: the missing positional write,
+          # and an allocCluster that read four bytes per candidate cluster and
+          # restarted from cluster 2 on every call. Serving v0.3.0 with
+          # -no-positional therefore measures a read-modify-write on top of a
+          # FIXED allocator, which is a genuine intermediate figure but is not
+          # what a user saw. All three arms are reported for that reason.
+          cp -r . /tmp/baseline
+          (cd /tmp/baseline \
+            && go mod edit -replace=github.com/go-filesystems/nfs="$GITHUB_WORKSPACE/nfs" \
+            && go mod edit -require=github.com/go-filesystems/fat32@v0.1.0 \
+            && go mod tidy \
+            && go build -mod=mod -o /tmp/bench/fat32demo-v010 .)
+          sudo mkdir -p /mnt/bench
+
+          # One arm. $1 is the label, $2 is either empty or -no-positional.
+          #
+          # dd uses oflag=direct so that each 64 KiB block is one WRITE RPC:
+          # buffered writes would be coalesced by the page cache into wsize
+          # chunks at a time the kernel chooses, which measures the writeback
+          # heuristics rather than the server. wsize=65536 pins the block size
+          # on the wire to the 64 KiB the measurement names.
+          # $1 is the label, $2 the binary, $3 the tag the timing is filed
+          # under, and $4.. any extra fat32demo flags;
+          # and MIB the size to write. The size is a variable because the
+          # claim being tested is a SHAPE, not a single number: the whole-file
+          # path costs O(filesize) per request, so quadrupling the data must
+          # cost about sixteen times as much, while the positional path must
+          # stay linear. One size cannot tell those apart.
+          MIB=2
+          run_arm() {
+            label="$1"; bin="$2"; tag="$3"; shift 3
+            /tmp/bench/mkimg /tmp/bench/disk.img
+            "$bin" -image /tmp/bench/disk.img -addr 127.0.0.1:12049 -rw "$@" &
+            demo_pid=$!
+            trap 'sudo umount -f /mnt/bench 2>/dev/null || true; kill $demo_pid 2>/dev/null || true' RETURN
+            for i in $(seq 1 50); do
+              if (exec 3<>/dev/tcp/127.0.0.1/12049) 2>/dev/null; then break; fi
+              sleep 0.2
+            done
+            sudo mount -t nfs -o vers=3,tcp,port=12049,mountport=12049,nolock,hard,timeo=600,wsize=65536,rsize=65536 \
+              127.0.0.1:/ /mnt/bench
+            start=$(date +%s.%N)
+            sudo dd if=/dev/urandom of=/mnt/bench/TARGET.BIN bs=64k count=$((MIB * 16)) \
+              oflag=direct conv=notrunc status=none
+            end=$(date +%s.%N)
+            secs=$(python3 -c "print(f'{$end-$start:.2f}')")
+            rate=$(python3 -c "print(f'{$MIB*1024*1024/($end-$start)/1000:.0f}')")
+            echo "RESULT $label: $MIB MiB in 64 KiB blocks took ${secs}s (${rate} kB/s)"
+            echo "$secs" > "/tmp/bench/secs.$MIB.$tag"
+            sudo umount /mnt/bench
+            kill $demo_pid 2>/dev/null || true
+            wait $demo_pid 2>/dev/null || true
+          }
+
+          for MIB in 2 8; do
+            run_arm "BEFORE  fat32 v0.1.0, whole-file write, original allocator" /tmp/bench/fat32demo-v010 before
+            run_arm "AFTER   fat32 v0.3.0, positional write                  " /tmp/bench/fat32demo after
+            # The middle arm answers one question only — is the gain the
+            # positional write, or the quadratic-allocator fix that shipped
+            # beside it in fat32 v0.3.0? — and 2 MiB answers it as well as
+            # 8 MiB does, at a fraction of the cost. Running the slow path
+            # twice at the large size buys nothing and can double a job that
+            # is already dominated by the defect it is demonstrating.
+            if [ "$MIB" = 2 ]; then
+              run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo middle -no-positional
+            fi
+          done
+
+          # A benchmark that only prints regresses silently, so this one is a
+          # gate. The threshold is deliberately far below what is measured
+          # (20x at 8 MiB) rather than close to it: a shared runner's variance
+          # is real, and a gate that fails on noise gets deleted. Only the
+          # 8 MiB point is asserted — at 2 MiB the fixed per-request cost
+          # dominates and the two paths are within each other's noise, which
+          # is itself the reason the job measures two sizes.
+          before=$(cat /tmp/bench/secs.8.before)
+          after=$(cat /tmp/bench/secs.8.after)
+          python3 - "$before" "$after" <<'PY'
+          import sys
+          before, after = float(sys.argv[1]), float(sys.argv[2])
+          ratio = before / after
+          print(f"8 MiB: whole-file {before}s / positional {after}s = {ratio:.1f}x")
+          if ratio < 5:
+              raise SystemExit(f"FAIL: the positional write is only {ratio:.1f}x faster; it must be at least 5x")
+          PY
+
+      - name: A soft,timeo=50 mount must survive the write it used to fail
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          # The original defect was not only slow: a soft-mounted client GAVE
+          # UP with EIO, because one whole-file WRITE round-trip exceeded its
+          # timeout. This asserts the write now completes on the very mount
+          # options that used to break it.
+          /tmp/bench/mkimg /tmp/bench/soft.img
+          /tmp/bench/fat32demo -image /tmp/bench/soft.img -addr 127.0.0.1:12050 -rw &
+          demo_pid=$!
+          trap 'sudo umount -f /mnt/soft 2>/dev/null || true; kill $demo_pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/12050) 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          sudo mkdir -p /mnt/soft
+          sudo mount -t nfs -o vers=3,tcp,port=12050,mountport=12050,nolock,soft,timeo=50,retrans=2,wsize=65536 \
+            127.0.0.1:/ /mnt/soft
+          sudo dd if=/dev/urandom of=/mnt/soft/TARGET.BIN bs=64k count=32 \
+            oflag=direct conv=notrunc status=none
+          test "$(stat -c %s /mnt/soft/TARGET.BIN)" -eq 2097152
+          echo "soft,timeo=50 completed 2 MiB with no EIO"
+          sudo umount /mnt/soft

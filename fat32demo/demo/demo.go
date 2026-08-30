@@ -20,6 +20,7 @@ import (
 	"os"
 
 	fat32 "github.com/go-filesystems/fat32"
+	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/nfs"
 )
 
@@ -39,6 +40,32 @@ var newServer = nfs.New
 // The returned server owns nothing but the export; the caller closes both it
 // and the listener.
 func Setup(image, addr string, readWrite bool, out io.Writer) (*nfs.Server, net.Listener, error) {
+	return SetupOpts(image, addr, readWrite, false, out)
+}
+
+// wholeFileOnly hides a driver's OpenFile, and therefore its
+// filesystem.Opener and filesystem.WritableFile capabilities, from the server.
+//
+// # Why a demo has a switch for making itself slow
+//
+// The value of a positional write is a NUMBER, and a number needs a baseline
+// measured the same way. Comparing this repository's HEAD against a checkout
+// of an older commit would compare two builds on two machines at two times,
+// which measures the machines as much as the code. Wrapping the same driver,
+// in the same process, on the same image, and taking the capability away is
+// the only A/B where the single difference is the thing being measured.
+//
+// Struct embedding is what makes it exact: every Filesystem method is promoted
+// unchanged, so the driver underneath is untouched — only the optional
+// interfaces, which are matched on the outer type, disappear. The server then
+// takes the ReadFile+splice+WriteFile path it takes for any driver without
+// them, which is the code that was there before WritableFile existed.
+type wholeFileOnly struct{ filesystem.Filesystem }
+
+// SetupOpts is [Setup] with the measurement switch. Pass noPositional to serve
+// the image as if the driver had no Opener/WritableFile capability at all; see
+// [wholeFileOnly].
+func SetupOpts(image, addr string, readWrite, noPositional bool, out io.Writer) (*nfs.Server, net.Listener, error) {
 	fi, err := os.Stat(image)
 	if err != nil {
 		return nil, nil, err
@@ -55,11 +82,16 @@ func Setup(image, addr string, readWrite bool, out io.Writer) (*nfs.Server, net.
 	// The image's size is the one capacity figure that is actually known
 	// here; the Filesystem contract has no statfs, so without this `df`
 	// would report zero. Free space is genuinely unknown, hence 0.
+	var exported filesystem.Filesystem = fsys
+	if noPositional {
+		exported = wholeFileOnly{fsys}
+		fmt.Fprintln(out, "positional read/write DISABLED: serving through ReadFile/WriteFile only")
+	}
 	opts := []nfs.ExportOption{nfs.WithCapacity(uint64(fi.Size()), 0)}
 	if readWrite {
 		opts = append(opts, nfs.ReadWrite())
 	}
-	if err := srv.Export("/", fsys, opts...); err != nil {
+	if err := srv.Export("/", exported, opts...); err != nil {
 		fsys.Close()
 		return nil, nil, err
 	}
@@ -83,10 +115,12 @@ func Main(args []string, out, errOut io.Writer) int {
 	image := fs.String("image", "", "path to a FAT32 image")
 	addr := fs.String("addr", "127.0.0.1:12049", "listen address")
 	rw := fs.Bool("rw", false, "export read-write (default read-only)")
+	noPositional := fs.Bool("no-positional", false,
+		"hide the driver's Opener/WritableFile capabilities, forcing whole-file reads and writes (for A/B measurement)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	srv, ln, err := Setup(*image, *addr, *rw, out)
+	srv, ln, err := SetupOpts(*image, *addr, *rw, *noPositional, out)
 	if err != nil {
 		fmt.Fprintln(errOut, "fat32demo:", err)
 		return 1

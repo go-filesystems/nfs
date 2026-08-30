@@ -310,27 +310,50 @@ func (c *capFS) Chtimes(path string, atime, mtime time.Time) error {
 
 // --- the Opener capability, declared the way interface declares it ---------
 
-// openerFile mirrors github.com/go-filesystems/interface.File: a *distinct*
-// named interface with the same method set. A driver's OpenFile returns this
-// type, not the server's own File, which is exactly the situation the
-// server's reflection probe exists to handle — a plain type assertion here
-// would fail.
-type openerFile interface {
+// foreignFile is a *distinct named interface* with exactly the method set of
+// github.com/go-filesystems/interface.File.
+//
+// It exists to pin down the one rule this module used to work around with
+// reflection: Go matches method sets by TYPE IDENTITY, not by structure. A
+// driver whose OpenFile returns this type is not an interface.Opener, however
+// identical it looks, and the server must fall back rather than pretend. That
+// is now a compile-time fact, and [TestNonInterfaceOpenersFallBack] is what
+// keeps it observable.
+type foreignFile interface {
 	io.ReaderAt
 	io.Closer
 	Size() int64
 }
 
-// openFS is a memFS that implements the optional random-access capability.
+// openFS is a memFS that implements the optional random-access capability,
+// with the real interface types.
 type openFS struct {
 	*memFS
 	openErr error
 	// nilFile makes OpenFile return (nil, nil), the driver bug the server
 	// has to survive rather than panic on.
 	nilFile bool
+	// writable makes the File a filesystem.WritableFile, which is what puts
+	// the server on its positional write path.
+	writable bool
+	// writeErr, syncErr and closeErr inject failures on each of the three
+	// calls the positional write path makes, in the order it makes them.
+	writeErr, syncErr, closeErr error
+	// lastWrite records the offset and length of the last WriteAt, so a test
+	// can prove the server wrote AT AN OFFSET rather than rewriting the file.
+	lastWriteOff int64
+	lastWriteLen int
+	// wholeFileWrites counts WriteFile calls, so a test can prove the
+	// positional path did not quietly fall back.
+	wholeFileWrites int
 }
 
-func (o *openFS) OpenFile(path string) (openerFile, error) {
+func (o *openFS) WriteFile(path string, data []byte, perm os.FileMode) error {
+	o.wholeFileWrites++
+	return o.memFS.WriteFile(path, data, perm)
+}
+
+func (o *openFS) OpenFile(path string) (filesystem.File, error) {
 	if o.openErr != nil {
 		return nil, o.openErr
 	}
@@ -343,19 +366,23 @@ func (o *openFS) OpenFile(path string) (openerFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &memFile{data: n.data}, nil
+	if o.writable {
+		return &memWFile{owner: o, node: n}, nil
+	}
+	return &memFile{data: n.data, closeErr: o.closeErr}, nil
 }
 
 type memFile struct {
-	data    []byte
-	readErr error
-	closed  bool
+	data     []byte
+	readErr  error
+	closeErr error
+	closed   bool
 }
 
 func (f *memFile) Size() int64 { return int64(len(f.data)) }
 func (f *memFile) Close() error {
 	f.closed = true
-	return nil
+	return f.closeErr
 }
 
 func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
@@ -372,11 +399,87 @@ func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// badOpener has an OpenFile with the wrong shape, so the probe must reject it
-// and fall back to ReadFile rather than call it.
+// memWFile is a filesystem.WritableFile over a memFS node: it writes through
+// to the node's bytes at the offset it is given, extending with zeros, which
+// is the behaviour a real driver's WriteAt has and the behaviour the server's
+// positional path depends on.
+type memWFile struct {
+	owner *openFS
+	node  *memNode
+}
+
+var _ filesystem.WritableFile = (*memWFile)(nil)
+
+func (f *memWFile) Size() int64 {
+	f.owner.mu.Lock()
+	defer f.owner.mu.Unlock()
+	return int64(len(f.node.data))
+}
+
+func (f *memWFile) Close() error { return f.owner.closeErr }
+
+func (f *memWFile) ReadAt(p []byte, off int64) (int, error) {
+	f.owner.mu.Lock()
+	defer f.owner.mu.Unlock()
+	if off >= int64(len(f.node.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.node.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (f *memWFile) WriteAt(p []byte, off int64) (int, error) {
+	if f.owner.writeErr != nil {
+		return 0, f.owner.writeErr
+	}
+	f.owner.mu.Lock()
+	defer f.owner.mu.Unlock()
+	f.owner.lastWriteOff, f.owner.lastWriteLen = off, len(p)
+	if end := off + int64(len(p)); end > int64(len(f.node.data)) {
+		grown := make([]byte, end)
+		copy(grown, f.node.data)
+		f.node.data = grown
+	}
+	copy(f.node.data[off:], p)
+	return len(p), nil
+}
+
+func (f *memWFile) Truncate(size int64) error {
+	f.owner.mu.Lock()
+	defer f.owner.mu.Unlock()
+	if size < 0 {
+		return errors.New("memfs: negative size")
+	}
+	grown := make([]byte, size)
+	copy(grown, f.node.data)
+	f.node.data = grown
+	return nil
+}
+
+func (f *memWFile) Sync() error { return f.owner.syncErr }
+
+// The four types below all have a method NAMED OpenFile that is not
+// filesystem.Opener. Before v0.3.0 of the interface module this server matched
+// OpenFile by shape, so each of these had to be rejected by an explicit check;
+// now the compiler rejects them for free, and they are kept as the evidence
+// that a near-miss falls back to ReadFile instead of being called.
+
+// foreignOpener is the near-miss that matters: the right shape, the right
+// semantics, a structurally identical result type — and a different named
+// type, so it is not the capability.
+type foreignOpener struct{ *memFS }
+
+func (f *foreignOpener) OpenFile(path string) (foreignFile, error) {
+	return &memFile{data: []byte("this must never be served")}, nil
+}
+
+// badOpener has an extra argument.
 type badOpener struct{ *memFS }
 
-func (b *badOpener) OpenFile(path string, extra int) (openerFile, error) { return nil, nil }
+func (b *badOpener) OpenFile(path string, extra int) (foreignFile, error) { return nil, nil }
 
 // wrongResultOpener returns a type that does not satisfy File.
 type wrongResultOpener struct{ *memFS }
@@ -386,19 +489,19 @@ func (w *wrongResultOpener) OpenFile(path string) (int, error) { return 0, nil }
 // notStringOpener takes something other than a path.
 type notStringOpener struct{ *memFS }
 
-func (n *notStringOpener) OpenFile(i int) (openerFile, error) { return nil, nil }
+func (n *notStringOpener) OpenFile(i int) (foreignFile, error) { return nil, nil }
 
 // oneResultOpener has the wrong arity.
 type oneResultOpener struct{ *memFS }
 
-func (o *oneResultOpener) OpenFile(path string) openerFile { return nil }
+func (o *oneResultOpener) OpenFile(path string) foreignFile { return nil }
 
-// errFile is an OpenFile result whose ReadAt fails.
+// errOpenFS is an OpenFile result whose ReadAt fails.
 type errOpenFS struct {
 	*memFS
 	err error
 }
 
-func (e *errOpenFS) OpenFile(path string) (openerFile, error) {
+func (e *errOpenFS) OpenFile(path string) (filesystem.File, error) {
 	return &memFile{data: make([]byte, 16), readErr: e.err}, nil
 }

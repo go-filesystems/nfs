@@ -162,14 +162,54 @@ which materialises the **entire file** for every READ — so streaming a 4 GiB
 image in 128 KiB reads costs 32768 full-file reads. Correct, but only usable
 for small files.
 
-**Writes.** `Filesystem` has `WriteFile` (whole-file replace) and no
-positional write, so a WRITE at a non-zero offset reads the file, splices, and
-writes it back: **O(filesize) per request**. Measured over a real mount, a
-2 MiB `dd` in 64 KiB blocks took **23 s (90 kB/s)** against a FAT32 image on a
-cloud disk, and a `soft,timeo=50` mount reports `EIO` partway through because
-a single WRITE round exceeds the client's 5-second timeout. Use `hard` and a
-generous `timeo` until `interface` grows a `WriteAt` — the write-side twin of
-`Opener`.
+**Writes.** A driver whose `OpenFile` returns a
+[`filesystem.WritableFile`](https://pkg.go.dev/github.com/go-filesystems/interface#WritableFile)
+— `io.WriterAt` + `Truncate` + `Sync` — is written **at the offset the client
+sent**, and the request costs the bytes it carries.
+
+A driver *without* one is written the only way `Filesystem` allows: `WriteFile`
+replaces a whole file, so a WRITE at a non-zero offset reads the file, splices,
+and writes it back, at **O(filesize) per request**. A client streaming a file
+in `wtpref`-sized blocks pays that per block, so the transfer is quadratic.
+
+The numbers below are taken by the `live-write-bench` CI job, whose arms run
+**in the same job on the same runner** against the same image, differing in one
+flag (`fat32demo -no-positional`, which hides the driver's capability). A real
+Linux kernel NFS client writes with `wsize=65536` and `oflag=direct`, so each
+64 KiB block is one WRITE RPC:
+
+| write path | 2 MiB | 8 MiB |
+|---|---|---|
+| whole-file (`ReadFile` + splice + `WriteFile`) | 1.60 s (1.3 MB/s) | **69.20 s (121 kB/s)** |
+| positional (`filesystem.WritableFile`) | 0.24 s (8.7 MB/s) | **0.98 s (8.6 MB/s)** |
+
+Two sizes, because the claim is a **shape**, not a number. Quadruple the data
+and the whole-file path costs **43× more** while the positional path costs
+**4.1×**: quadratic against linear, which is the cost model, visible. The
+positional path holds ~8.6 MB/s at both sizes; the whole-file path falls from
+1.3 MB/s to 121 kB/s and keeps falling. The job fails if the 8 MiB ratio drops
+below 5×.
+
+A caveat worth stating: the whole-file arm is **very sensitive to the runner**.
+Across runs of this same job its 8 MiB time ranged from 31 s to 69 s
+(269 kB/s down to 121 kB/s), while the positional arm stayed between 0.98 s and
+1.51 s. Consecutive runs on the same runner class do agree closely — 68.89 s
+and 69.20 s, against 0.99 s and 0.98 s — so the spread is between machines, not
+noise within one. That range brackets the **90 kB/s** this section used to
+quote from a measurement taken elsewhere at a size nobody recorded, so the old
+figure is consistent with what is measured here; it is the *shape*, not any
+single number, that should be trusted.
+
+Pinning the driver back to `fat32` v0.1.0 — the version named in this module's
+`go.mod` when that figure was taken — is a third arm of the job, and it lands
+within noise of the second (69.20 s against 68.33 s at 8 MiB; 1.59 s against
+1.66 s at 2 MiB, where the job still runs all three). That says the gain is the
+positional write and **not** the quadratic-allocator fix that shipped alongside
+it in `fat32` v0.3.0.
+
+The original defect was not only slowness: a `soft,timeo=50` mount reported
+`EIO` partway through, because a single WRITE round-trip exceeded the client's
+timeout. That mount is now part of the same job, and must complete.
 
 **FSSTAT.** There is no statfs in the contract, so an export with no
 [`WithCapacity`](https://pkg.go.dev/github.com/go-filesystems/nfs#WithCapacity)

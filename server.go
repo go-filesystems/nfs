@@ -34,8 +34,10 @@ type export struct {
 	id   uint64
 	path string
 	fs   filesystem.Filesystem
-	// open is the driver's random-access reader, or nil when it has none.
-	open func(string) (File, error)
+	// open is the driver's random-access capability, or nil when it has none.
+	// It serves READ at an offset, and — when the File it returns is also a
+	// WritableFile — WRITE at an offset too.
+	open Opener
 	ro   bool
 	// total and avail feed FSSTAT. Zero means "unknown"; see [WithCapacity].
 	total, avail uint64

@@ -293,7 +293,7 @@ func (s *Server) procRead(c *rpc.Call) rpc.Status {
 // The caller must hold [Server.fsmu].
 func (s *Server) readAt(e *export, path string, off uint64, count int) ([]byte, bool, Status) {
 	if e.open != nil {
-		f, err := e.open(path)
+		f, err := e.openFile(path)
 		if err != nil {
 			return nil, false, statusFor(err, StatusIO)
 		}
