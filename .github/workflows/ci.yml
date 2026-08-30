@@ -426,7 +426,8 @@ jobs:
           # chunks at a time the kernel chooses, which measures the writeback
           # heuristics rather than the server. wsize=65536 pins the block size
           # on the wire to the 64 KiB the measurement names.
-          # $3.. are extra fat32demo flags; $1 is the label, $2 the binary,
+          # $1 is the label, $2 the binary, $3 the tag the timing is filed
+          # under, and $4.. any extra fat32demo flags;
           # and MIB the size to write. The size is a variable because the
           # claim being tested is a SHAPE, not a single number: the whole-file
           # path costs O(filesize) per request, so quadrupling the data must
@@ -434,7 +435,7 @@ jobs:
           # stay linear. One size cannot tell those apart.
           MIB=2
           run_arm() {
-            label="$1"; bin="$2"; shift 2
+            label="$1"; bin="$2"; tag="$3"; shift 3
             /tmp/bench/mkimg /tmp/bench/disk.img
             "$bin" -image /tmp/bench/disk.img -addr 127.0.0.1:12049 -rw "$@" &
             demo_pid=$!
@@ -452,7 +453,7 @@ jobs:
             secs=$(python3 -c "print(f'{$end-$start:.2f}')")
             rate=$(python3 -c "print(f'{$MIB*1024*1024/($end-$start)/1000:.0f}')")
             echo "RESULT $label: $MIB MiB in 64 KiB blocks took ${secs}s (${rate} kB/s)"
-            echo "$secs" > "/tmp/bench/secs.$MIB.$3"
+            echo "$secs" > "/tmp/bench/secs.$MIB.$tag"
             sudo umount /mnt/bench
             kill $demo_pid 2>/dev/null || true
             wait $demo_pid 2>/dev/null || true
@@ -460,7 +461,7 @@ jobs:
 
           for MIB in 2 8; do
             run_arm "BEFORE  fat32 v0.1.0, whole-file write, original allocator" /tmp/bench/fat32demo-v010 before
-            run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo -no-positional middle
+            run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo middle -no-positional
             run_arm "AFTER   fat32 v0.3.0, positional write                  " /tmp/bench/fat32demo after
           done
 
