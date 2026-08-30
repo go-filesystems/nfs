@@ -347,6 +347,12 @@ jobs:
   live-write-bench:
     name: live write benchmark (linux kernel client)
     runs-on: ubuntu-latest
+    # The whole-file arm is deliberately running the quadratic path, and how
+    # long that takes is a property of the runner as much as of the code: the
+    # same 8 MiB arm has taken 31 s and 69 s on different runners, and slower
+    # ones exist. A cap turns "the defect is worse here than usual" into a
+    # failed job rather than an hour of a queue.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -461,8 +467,16 @@ jobs:
 
           for MIB in 2 8; do
             run_arm "BEFORE  fat32 v0.1.0, whole-file write, original allocator" /tmp/bench/fat32demo-v010 before
-            run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo middle -no-positional
             run_arm "AFTER   fat32 v0.3.0, positional write                  " /tmp/bench/fat32demo after
+            # The middle arm answers one question only — is the gain the
+            # positional write, or the quadratic-allocator fix that shipped
+            # beside it in fat32 v0.3.0? — and 2 MiB answers it as well as
+            # 8 MiB does, at a fraction of the cost. Running the slow path
+            # twice at the large size buys nothing and can double a job that
+            # is already dominated by the defect it is demonstrating.
+            if [ "$MIB" = 2 ]; then
+              run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo middle -no-positional
+            fi
           done
 
           # A benchmark that only prints regresses silently, so this one is a
