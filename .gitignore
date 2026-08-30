@@ -1,0 +1,7 @@
+cover.out
+coverage.out
+cov.out
+*.test
+*.img
+*.dmg
+*.cdr
