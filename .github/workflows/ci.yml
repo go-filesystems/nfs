@@ -397,6 +397,26 @@ jobs:
           go build -mod=mod -o /tmp/bench/mkimg ./mkimg
           rm -rf ./mkimg
           go build -mod=mod -o /tmp/bench/fat32demo .
+
+          # The ORIGINAL baseline, built from the same source with the driver
+          # pinned to fat32 v0.1.0 — the version that was in this module's
+          # go.mod when 90 kB/s was measured, and the last one with neither
+          # Opener nor WritableFile.
+          #
+          # Pinning the driver rather than only passing -no-positional matters,
+          # and getting this wrong would have produced a flattering number.
+          # fat32 v0.3.0 removed TWO quadratics: the missing positional write,
+          # and an allocCluster that read four bytes per candidate cluster and
+          # restarted from cluster 2 on every call. Serving v0.3.0 with
+          # -no-positional therefore measures a read-modify-write on top of a
+          # FIXED allocator, which is a genuine intermediate figure but is not
+          # what a user saw. All three arms are reported for that reason.
+          cp -r . /tmp/baseline
+          (cd /tmp/baseline \
+            && go mod edit -replace=github.com/go-filesystems/nfs="$GITHUB_WORKSPACE/nfs" \
+            && go mod edit -require=github.com/go-filesystems/fat32@v0.1.0 \
+            && go mod tidy \
+            && go build -mod=mod -o /tmp/bench/fat32demo-v010 .)
           sudo mkdir -p /mnt/bench
 
           # One arm. $1 is the label, $2 is either empty or -no-positional.
@@ -407,9 +427,9 @@ jobs:
           # heuristics rather than the server. wsize=65536 pins the block size
           # on the wire to the 64 KiB the measurement names.
           run_arm() {
-            label="$1"; shift
+            label="$1"; bin="$2"; shift 2
             /tmp/bench/mkimg /tmp/bench/disk.img
-            /tmp/bench/fat32demo -image /tmp/bench/disk.img -addr 127.0.0.1:12049 -rw "$@" &
+            "$bin" -image /tmp/bench/disk.img -addr 127.0.0.1:12049 -rw "$@" &
             demo_pid=$!
             trap 'sudo umount -f /mnt/bench 2>/dev/null || true; kill $demo_pid 2>/dev/null || true' RETURN
             for i in $(seq 1 50); do
@@ -430,8 +450,9 @@ jobs:
             wait $demo_pid 2>/dev/null || true
           }
 
-          run_arm "whole-file (ReadFile+splice+WriteFile, the path before WritableFile)" -no-positional
-          run_arm "positional (filesystem.WritableFile)"
+          run_arm "BEFORE  fat32 v0.1.0, whole-file write, original allocator" /tmp/bench/fat32demo-v010
+          run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo -no-positional
+          run_arm "AFTER   fat32 v0.3.0, positional write                  " /tmp/bench/fat32demo
 
       - name: A soft,timeo=50 mount must survive the write it used to fail
         working-directory: nfs/fat32demo
