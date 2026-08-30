@@ -1,0 +1,45 @@
+version: '3'
+
+# GOWORK is forced off: this module and its fat32demo sibling resolve
+# `github.com/go-filesystems/interface` (and `fat32`) through a `replace`
+# pointing at the adjacent checkout, which any developer go.work at the fleet
+# root would otherwise override with a different copy.
+env:
+  GOWORK: off
+  CGO_ENABLED: '0'
+
+tasks:
+  build:
+    desc: "Build the module"
+    cmds:
+      - go build ./...
+
+  test:
+    desc: "Run tests with race + coverage"
+    cmds:
+      # -coverpkg is required: the xdr and rpc packages are exercised through
+      # the server's own tests, and without it their coverage is attributed
+      # to nothing.
+      - go test -race -coverpkg=./... -coverprofile=cover.out -covermode=atomic ./...
+      - go tool cover -func=cover.out | tail -1
+
+  lint:
+    desc: "Vet the module"
+    cmds:
+      - go vet ./...
+
+  demo:
+    desc: "Build and test the fat32demo harness"
+    dir: fat32demo
+    cmds:
+      - go vet ./...
+      - go test -race -coverpkg=./demo/... -coverprofile=cover.out -covermode=atomic ./demo/...
+      - go tool cover -func=cover.out | tail -1
+
+  ci:
+    desc: "Run lint + build + test (what the GitHub Actions workflow runs)"
+    cmds:
+      - task: lint
+      - task: build
+      - task: test
+      - task: demo

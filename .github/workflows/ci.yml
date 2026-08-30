@@ -1,0 +1,338 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Both modules resolve github.com/go-filesystems/{interface,fat32} from the
+  # module proxy at v0.1.0 — no sibling checkout, no local replace except
+  # fat32demo's pointer at its own parent. GOWORK=off keeps any developer
+  # go.work out of CI regardless.
+  GOWORK: off
+
+jobs:
+  # ----------------------------------------------------------------------
+  # Core module — depends ONLY on go-filesystems/interface plus the standard
+  # library. The 100% coverage gate is enforced here.
+  # ----------------------------------------------------------------------
+  core-native:
+    name: core native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout nfs
+        uses: actions/checkout@v7
+        with:
+          path: nfs
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/go.mod
+
+      - name: Vet
+        working-directory: nfs
+        run: go vet -mod=mod ./...
+
+      - name: Build (CGO disabled — the module must stay pure Go)
+        working-directory: nfs
+        env:
+          CGO_ENABLED: "0"
+        run: go build -mod=mod ./...
+
+      - name: Test (race + coverage)
+        working-directory: nfs
+        run: go test -mod=mod -race -coverpkg=./... -coverprofile=cover.out -covermode=atomic ./...
+
+      - name: Enforce coverage gate
+        working-directory: nfs
+        run: |
+          set -euo pipefail
+          pct=$(go tool cover -func=cover.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "total coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 100.0) ? 0 : 1 }' \
+            || { echo "coverage ${pct}% below gate 100.0%"; exit 1; }
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-core-${{ matrix.arch }}
+          path: nfs/cover.out
+          if-no-files-found: ignore
+
+  # ----------------------------------------------------------------------
+  # Core module — emulated 64-bit arches. NFS and XDR are big-endian on the
+  # wire, so s390x is not a formality here: it is the arch on which a
+  # forgotten binary.BigEndian would still pass on the developer's machine.
+  # ----------------------------------------------------------------------
+  core-emulated:
+    name: core emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu: qemu
+    steps:
+      - name: Checkout nfs
+        uses: actions/checkout@v7
+        with:
+          path: nfs
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/go.mod
+
+      - name: Register QEMU binfmt handlers
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+
+      - name: Cross-compile per-package test binaries
+        working-directory: nfs
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tests
+          for pkg in $(go list -mod=mod ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            go test -mod=mod -c -cover -o "/tmp/tests/${name}.test" "$pkg"
+          done
+          ls -la /tmp/tests
+
+      - name: Run test binaries under QEMU (${{ matrix.arch }})
+        env:
+          QEMU_CPU: ${{ matrix.qemu }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(/tmp/tests/*.test)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "no test binaries to run"; exit 0
+          fi
+          rc=0
+          for bin in "${bins[@]}"; do
+            echo "::group::$(basename "$bin")"
+            if ! docker run --rm \
+              --platform linux/${{ matrix.arch }} \
+              -e QEMU_CPU="${QEMU_CPU}" \
+              --user 1000:1000 \
+              -v /tmp/tests:/t -w /t \
+              ${{ matrix.image }} \
+              "./$(basename "$bin")" -test.v; then
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
+
+  # ----------------------------------------------------------------------
+  # The module must build for every platform it claims to serve. A mount is
+  # a client-side act, but the server has to run somewhere.
+  # ----------------------------------------------------------------------
+  cross-build:
+    name: cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: nfs
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/go.mod
+      - name: Build for every advertised platform
+        working-directory: nfs
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          for target in darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 \
+                        linux/amd64 linux/arm64 freebsd/amd64 openbsd/amd64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go build -mod=mod ./...
+            echo "ok $target"
+          done
+
+  # ----------------------------------------------------------------------
+  # fat32demo — the real-image harness. It imports the fat32 driver, so it is
+  # its own module, keeping the core module free of any driver dependency
+  # (the same split detect/fat32reg uses).
+  # ----------------------------------------------------------------------
+  demo-native:
+    name: demo native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: nfs
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/fat32demo/go.mod
+
+      - name: Vet
+        working-directory: nfs/fat32demo
+        run: go vet -mod=mod ./...
+
+      - name: Build
+        working-directory: nfs/fat32demo
+        env:
+          CGO_ENABLED: "0"
+        run: go build -mod=mod ./...
+
+      # The gate covers ./demo/..., which holds everything the command does.
+      # main.go is a single os.Exit(demo.Main(...)) and is excluded rather
+      # than papered over with a lowered threshold.
+      - name: Test (race + coverage)
+        working-directory: nfs/fat32demo
+        run: go test -mod=mod -race -coverpkg=./demo/... -coverprofile=cover.out -covermode=atomic ./demo/...
+
+      - name: Enforce coverage gate
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          pct=$(go tool cover -func=cover.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "total coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 100.0) ? 0 : 1 }' \
+            || { echo "coverage ${pct}% below gate 100.0%"; exit 1; }
+
+  # ----------------------------------------------------------------------
+  # The end-to-end proof: a real Linux kernel NFS client mounts a real FAT32
+  # image and reads it back. Everything above only shows the server agrees
+  # with itself; this shows a kernel agrees with it.
+  # ----------------------------------------------------------------------
+  live-mount:
+    name: live mount (linux kernel client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: nfs
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/fat32demo/go.mod
+
+      - name: Install the NFS client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nfs-common
+
+      - name: Build a real FAT32 image with the driver
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/live ./mkimg
+          cat > ./mkimg/main.go <<'EOF'
+          package main
+
+          import (
+              "bytes"
+              "log"
+
+              fat32 "github.com/go-filesystems/fat32"
+          )
+
+          func main() {
+              fs, err := fat32.Format("/tmp/live/disk.img", 64<<20, fat32.FormatConfig{Label: "LIVE"})
+              if err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.WriteFile("/HELLO.TXT", []byte("hello from a real image\n"), 0o644); err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.MkDir("/SUB", 0o755); err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.WriteFile("/SUB/BIG.BIN", bytes.Repeat([]byte("0123456789abcdef"), 8192), 0o644); err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.Close(); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go run -mod=mod ./mkimg
+          rm -rf ./mkimg
+          ls -l /tmp/live/disk.img
+
+      - name: Serve it and mount it with the kernel client
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          go build -mod=mod -o /tmp/live/fat32demo .
+          /tmp/live/fat32demo -image /tmp/live/disk.img -addr 127.0.0.1:12049 &
+          demo_pid=$!
+          # Clean up whatever happens: never leave a mount behind.
+          trap 'sudo umount -f /mnt/live 2>/dev/null || true; kill $demo_pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/12049) 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          sudo mkdir -p /mnt/live
+          sudo mount -t nfs -o vers=3,tcp,port=12049,mountport=12049,nolock,hard,timeo=600 \
+            127.0.0.1:/ /mnt/live
+          mount | grep /mnt/live
+
+          echo "--- ls ---"
+          ls -la /mnt/live /mnt/live/SUB
+          echo "--- cat ---"
+          cat /mnt/live/HELLO.TXT
+          echo "--- find must descend (nlink must not trigger the leaf optimisation) ---"
+          test "$(find /mnt/live -type f | wc -l)" -eq 2
+          echo "--- bytes must match what the driver holds ---"
+          test "$(cat /mnt/live/HELLO.TXT)" = "hello from a real image"
+          nfs_sum=$(sha256sum < /mnt/live/SUB/BIG.BIN | cut -d' ' -f1)
+          want=$(python3 -c "import hashlib;print(hashlib.sha256(b'0123456789abcdef'*8192).hexdigest())")
+          echo "over NFS: $nfs_sum"
+          echo "expected: $want"
+          test "$nfs_sum" = "$want"
+
+          sudo umount /mnt/live
+          echo "unmounted cleanly"
