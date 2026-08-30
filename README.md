@@ -180,23 +180,29 @@ Linux kernel NFS client writes with `wsize=65536` and `oflag=direct`, so each
 
 | write path | 2 MiB | 8 MiB |
 |---|---|---|
-| whole-file (`ReadFile` + splice + `WriteFile`) | 0.66 s (3.2 MB/s) | **31.13 s (269 kB/s)** |
-| positional (`filesystem.WritableFile`) | 0.81 s (2.6 MB/s) | **1.51 s (5.5 MB/s)** |
+| whole-file (`ReadFile` + splice + `WriteFile`) | 1.60 s (1.3 MB/s) | **69.20 s (121 kB/s)** |
+| positional (`filesystem.WritableFile`) | 0.24 s (8.7 MB/s) | **0.98 s (8.6 MB/s)** |
 
-Two sizes, because the claim is a **shape**, not a number. At 2 MiB the fixed
-per-request cost dominates and the two paths are inside each other's run-to-run
-variance — the whole-file arm even wins, which is exactly why a single small
-measurement proves nothing. Quadruple the data and the whole-file path costs
-**47× more** while the positional path costs **1.9×**: quadratic against linear,
-which is the cost model, visible. The job fails if the 8 MiB ratio drops below
-5×.
+Two sizes, because the claim is a **shape**, not a number. Quadruple the data
+and the whole-file path costs **43× more** while the positional path costs
+**4.1×**: quadratic against linear, which is the cost model, visible. The
+positional path holds ~8.6 MB/s at both sizes; the whole-file path falls from
+1.3 MB/s to 121 kB/s and keeps falling. The job fails if the 8 MiB ratio drops
+below 5×.
 
-The 23 s / 90 kB/s that this section used to quote was measured on another
-machine at an unrecorded size; the 8 MiB row above is the same defect, taken
-reproducibly. Pinning the driver back to `fat32` v0.1.0 — the version named in
-this module's `go.mod` when that figure was taken — is a third arm of the job,
-and it lands within noise of the second, which says the gain is the positional
-write and not the allocator fix that shipped alongside it in `fat32` v0.3.0.
+A caveat worth stating: the whole-file arm is **very sensitive to the runner**.
+Across runs of this same job its 8 MiB time ranged from 31 s to 69 s
+(269 kB/s down to 121 kB/s), while the positional arm stayed between 0.98 s and
+1.51 s. That range brackets the **90 kB/s** this section used to quote from a
+measurement taken elsewhere at a size nobody recorded — so the old figure is
+consistent with what is measured here, and it is the *shape*, not any single
+number, that should be trusted.
+
+Pinning the driver back to `fat32` v0.1.0 — the version named in this module's
+`go.mod` when that figure was taken — is a third arm of the job, and it lands
+within noise of the second (69.20 s against 68.33 s). That says the gain is the
+positional write and **not** the quadratic-allocator fix that shipped alongside
+it in `fat32` v0.3.0.
 
 The original defect was not only slowness: a `soft,timeo=50` mount reported
 `EIO` partway through, because a single WRITE round-trip exceeded the client's
