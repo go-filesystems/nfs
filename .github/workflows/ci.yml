@@ -452,16 +452,35 @@ jobs:
             secs=$(python3 -c "print(f'{$end-$start:.2f}')")
             rate=$(python3 -c "print(f'{$MIB*1024*1024/($end-$start)/1000:.0f}')")
             echo "RESULT $label: $MIB MiB in 64 KiB blocks took ${secs}s (${rate} kB/s)"
+            echo "$secs" > "/tmp/bench/secs.$MIB.$3"
             sudo umount /mnt/bench
             kill $demo_pid 2>/dev/null || true
             wait $demo_pid 2>/dev/null || true
           }
 
           for MIB in 2 8; do
-            run_arm "BEFORE  fat32 v0.1.0, whole-file write, original allocator" /tmp/bench/fat32demo-v010
-            run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo -no-positional
-            run_arm "AFTER   fat32 v0.3.0, positional write                  " /tmp/bench/fat32demo
+            run_arm "BEFORE  fat32 v0.1.0, whole-file write, original allocator" /tmp/bench/fat32demo-v010 before
+            run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo -no-positional middle
+            run_arm "AFTER   fat32 v0.3.0, positional write                  " /tmp/bench/fat32demo after
           done
+
+          # A benchmark that only prints regresses silently, so this one is a
+          # gate. The threshold is deliberately far below what is measured
+          # (20x at 8 MiB) rather than close to it: a shared runner's variance
+          # is real, and a gate that fails on noise gets deleted. Only the
+          # 8 MiB point is asserted — at 2 MiB the fixed per-request cost
+          # dominates and the two paths are within each other's noise, which
+          # is itself the reason the job measures two sizes.
+          before=$(cat /tmp/bench/secs.8.before)
+          after=$(cat /tmp/bench/secs.8.after)
+          python3 - "$before" "$after" <<'PY'
+          import sys
+          before, after = float(sys.argv[1]), float(sys.argv[2])
+          ratio = before / after
+          print(f"8 MiB: whole-file {before}s / positional {after}s = {ratio:.1f}x")
+          if ratio < 5:
+              raise SystemExit(f"FAIL: the positional write is only {ratio:.1f}x faster; it must be at least 5x")
+          PY
 
       - name: A soft,timeo=50 mount must survive the write it used to fail
         working-directory: nfs/fat32demo

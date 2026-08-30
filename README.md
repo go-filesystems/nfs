@@ -172,15 +172,31 @@ replaces a whole file, so a WRITE at a non-zero offset reads the file, splices,
 and writes it back, at **O(filesize) per request**. A client streaming a file
 in `wtpref`-sized blocks pays that per block, so the transfer is quadratic.
 
-Both numbers below come from the same job on the same runner, differing in one
-flag (`fat32demo -no-positional`, which hides the driver's capability), with a
-real Linux kernel NFS client writing 2 MiB in 64 KiB blocks
-(`wsize=65536`, `oflag=direct`, one WRITE RPC per block) to a FAT32 image:
+The numbers below are taken by the `live-write-bench` CI job, whose arms run
+**in the same job on the same runner** against the same image, differing in one
+flag (`fat32demo -no-positional`, which hides the driver's capability). A real
+Linux kernel NFS client writes with `wsize=65536` and `oflag=direct`, so each
+64 KiB block is one WRITE RPC:
 
-| write path | 2 MiB in 64 KiB blocks |
-|---|---|
-| whole-file (`ReadFile` + splice + `WriteFile`) | see the `live-write-bench` CI job |
-| positional (`filesystem.WritableFile`) | see the `live-write-bench` CI job |
+| write path | 2 MiB | 8 MiB |
+|---|---|---|
+| whole-file (`ReadFile` + splice + `WriteFile`) | 0.66 s (3.2 MB/s) | **31.13 s (269 kB/s)** |
+| positional (`filesystem.WritableFile`) | 0.81 s (2.6 MB/s) | **1.51 s (5.5 MB/s)** |
+
+Two sizes, because the claim is a **shape**, not a number. At 2 MiB the fixed
+per-request cost dominates and the two paths are inside each other's run-to-run
+variance — the whole-file arm even wins, which is exactly why a single small
+measurement proves nothing. Quadruple the data and the whole-file path costs
+**47× more** while the positional path costs **1.9×**: quadratic against linear,
+which is the cost model, visible. The job fails if the 8 MiB ratio drops below
+5×.
+
+The 23 s / 90 kB/s that this section used to quote was measured on another
+machine at an unrecorded size; the 8 MiB row above is the same defect, taken
+reproducibly. Pinning the driver back to `fat32` v0.1.0 — the version named in
+this module's `go.mod` when that figure was taken — is a third arm of the job,
+and it lands within noise of the second, which says the gain is the positional
+write and not the allocator fix that shipped alongside it in `fat32` v0.3.0.
 
 The original defect was not only slowness: a `soft,timeo=50` mount reported
 `EIO` partway through, because a single WRITE round-trip exceeded the client's
