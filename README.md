@@ -193,14 +193,17 @@ below 5×.
 A caveat worth stating: the whole-file arm is **very sensitive to the runner**.
 Across runs of this same job its 8 MiB time ranged from 31 s to 69 s
 (269 kB/s down to 121 kB/s), while the positional arm stayed between 0.98 s and
-1.51 s. That range brackets the **90 kB/s** this section used to quote from a
-measurement taken elsewhere at a size nobody recorded — so the old figure is
-consistent with what is measured here, and it is the *shape*, not any single
-number, that should be trusted.
+1.51 s. Consecutive runs on the same runner class do agree closely — 68.89 s
+and 69.20 s, against 0.99 s and 0.98 s — so the spread is between machines, not
+noise within one. That range brackets the **90 kB/s** this section used to
+quote from a measurement taken elsewhere at a size nobody recorded, so the old
+figure is consistent with what is measured here; it is the *shape*, not any
+single number, that should be trusted.
 
 Pinning the driver back to `fat32` v0.1.0 — the version named in this module's
 `go.mod` when that figure was taken — is a third arm of the job, and it lands
-within noise of the second (69.20 s against 68.33 s). That says the gain is the
+within noise of the second (69.20 s against 68.33 s at 8 MiB; 1.59 s against
+1.66 s at 2 MiB, where the job still runs all three). That says the gain is the
 positional write and **not** the quadratic-allocator fix that shipped alongside
 it in `fat32` v0.3.0.
 
