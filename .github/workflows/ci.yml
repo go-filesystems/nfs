@@ -426,6 +426,13 @@ jobs:
           # chunks at a time the kernel chooses, which measures the writeback
           # heuristics rather than the server. wsize=65536 pins the block size
           # on the wire to the 64 KiB the measurement names.
+          # $3.. are extra fat32demo flags; $1 is the label, $2 the binary,
+          # and MIB the size to write. The size is a variable because the
+          # claim being tested is a SHAPE, not a single number: the whole-file
+          # path costs O(filesize) per request, so quadrupling the data must
+          # cost about sixteen times as much, while the positional path must
+          # stay linear. One size cannot tell those apart.
+          MIB=2
           run_arm() {
             label="$1"; bin="$2"; shift 2
             /tmp/bench/mkimg /tmp/bench/disk.img
@@ -439,20 +446,22 @@ jobs:
             sudo mount -t nfs -o vers=3,tcp,port=12049,mountport=12049,nolock,hard,timeo=600,wsize=65536,rsize=65536 \
               127.0.0.1:/ /mnt/bench
             start=$(date +%s.%N)
-            sudo dd if=/dev/urandom of=/mnt/bench/TARGET.BIN bs=64k count=32 \
+            sudo dd if=/dev/urandom of=/mnt/bench/TARGET.BIN bs=64k count=$((MIB * 16)) \
               oflag=direct conv=notrunc status=none
             end=$(date +%s.%N)
             secs=$(python3 -c "print(f'{$end-$start:.2f}')")
-            rate=$(python3 -c "print(f'{2*1024*1024/($end-$start)/1000:.0f}')")
-            echo "RESULT $label: 2 MiB in 64 KiB blocks took ${secs}s (${rate} kB/s)"
+            rate=$(python3 -c "print(f'{$MIB*1024*1024/($end-$start)/1000:.0f}')")
+            echo "RESULT $label: $MIB MiB in 64 KiB blocks took ${secs}s (${rate} kB/s)"
             sudo umount /mnt/bench
             kill $demo_pid 2>/dev/null || true
             wait $demo_pid 2>/dev/null || true
           }
 
-          run_arm "BEFORE  fat32 v0.1.0, whole-file write, original allocator" /tmp/bench/fat32demo-v010
-          run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo -no-positional
-          run_arm "AFTER   fat32 v0.3.0, positional write                  " /tmp/bench/fat32demo
+          for MIB in 2 8; do
+            run_arm "BEFORE  fat32 v0.1.0, whole-file write, original allocator" /tmp/bench/fat32demo-v010
+            run_arm "middle  fat32 v0.3.0, whole-file write, fixed allocator  " /tmp/bench/fat32demo -no-positional
+            run_arm "AFTER   fat32 v0.3.0, positional write                  " /tmp/bench/fat32demo
+          done
 
       - name: A soft,timeo=50 mount must survive the write it used to fail
         working-directory: nfs/fat32demo
