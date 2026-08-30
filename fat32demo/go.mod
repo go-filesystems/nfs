@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/go-filesystems/fat32 v0.1.0
-	github.com/go-filesystems/interface v0.1.0
+	github.com/go-filesystems/interface v0.2.0
 	github.com/go-filesystems/nfs v0.0.0
 )
 

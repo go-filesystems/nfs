@@ -1,2 +1,4 @@
 github.com/go-filesystems/interface v0.1.0 h1:Rec5051uFN55CTlZyF/3BAqhKB/HGWPKZRqW6Speb+k=
 github.com/go-filesystems/interface v0.1.0/go.mod h1:9MDfHNNKg9cW1qBa3hmURQj4jiWIdTo9Xpgdt8ZzvV8=
+github.com/go-filesystems/interface v0.2.0 h1:HmQRCkeS+K+q3WkI2WfGYfLV0zsKmCdAKTKWQNZjmAs=
+github.com/go-filesystems/interface v0.2.0/go.mod h1:9MDfHNNKg9cW1qBa3hmURQj4jiWIdTo9Xpgdt8ZzvV8=
