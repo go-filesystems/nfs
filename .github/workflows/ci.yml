@@ -598,8 +598,15 @@ jobs:
             sudo kadmin.local -r FLEET.TEST -q "ktadd -k /etc/krb5.keytab $p" >/dev/null
           done
           sudo chmod 600 /etc/krb5.keytab
-          sudo systemctl restart rpc-gssd || sudo systemctl start rpc-gssd
-          systemctl is-active rpc-gssd
+          # rpc.gssd is run in the FOREGROUND and verbose, into a log. The
+          # packaged unit is silent, and "access denied by server" is the
+          # same message whether the client never got a ticket or the server
+          # refused one — two opposite faults behind one sentence.
+          sudo systemctl stop rpc-gssd 2>/dev/null || true
+          sudo setsid /usr/sbin/rpc.gssd -vvv -f </dev/null > /tmp/gssd.log 2>&1 &
+          sleep 2
+          pgrep -a rpc.gssd
+          sudo klist -k /etc/krb5.keytab
 
       - name: Build an image, serve it with sec=krb5, mount it
         working-directory: nfs/fat32demo
@@ -635,7 +642,15 @@ jobs:
           /tmp/live/fat32demo -image /tmp/live/disk.img -addr 127.0.0.1:12049 \
             -keytab "$KRB5_TEST_KEYTAB" > /tmp/live/server.log 2>&1 &
           demo_pid=$!
-          trap 'sudo umount -f /mnt/krb5 2>/dev/null || true; kill $demo_pid 2>/dev/null || true; cat /tmp/live/server.log' EXIT
+          # Whatever happens, print the three logs that split the fault apart:
+          # the KDC says whether the client ever ASKED for a service ticket,
+          # gssd says what it did with one, and the server says what arrived.
+          diagnose() {
+            echo "::group::the KDC log"; sudo cat "$KRB5_TEST_DIR/kdc.log" 2>/dev/null | tail -40; echo "::endgroup::"
+            echo "::group::rpc.gssd"; sudo cat /tmp/gssd.log 2>/dev/null | tail -60; echo "::endgroup::"
+            echo "::group::the server"; cat /tmp/live/server.log 2>/dev/null; echo "::endgroup::"
+          }
+          trap 'sudo umount -f /mnt/krb5 2>/dev/null || true; kill $demo_pid 2>/dev/null || true; diagnose' EXIT
           for i in $(seq 1 50); do
             if (exec 3<>/dev/tcp/127.0.0.1/12049) 2>/dev/null; then break; fi
             sleep 0.2
