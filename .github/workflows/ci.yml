@@ -559,9 +559,17 @@ jobs:
   # refuses what it does not recognise.
   # ----------------------------------------------------------------------
   live-mount-krb5:
-    name: live mount with Kerberos (linux kernel client)
+    name: live mount with Kerberos (${{ matrix.sec }}, linux kernel client)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # sec=krb5 signs the call header; sec=krb5i signs the arguments and
+        # results as well. They are separate lanes because they are separate
+        # code paths on BOTH sides, and a single lane passing would say
+        # nothing about the other.
+        sec: [krb5, krb5i]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -659,18 +667,21 @@ jobs:
           sudo mkdir -p /mnt/krb5
           # sec=krb5 is the whole point: the kernel client will not fall back,
           # so a mount that succeeds is a mount RPCSEC_GSS carried.
-          sudo mount -t nfs -o vers=3,tcp,sec=krb5,port=12049,mountport=12049,nolock,hard,timeo=600 \
+          sudo mount -t nfs -o vers=3,tcp,sec=${{ matrix.sec }},port=12049,mountport=12049,nolock,hard,timeo=600 \
             127.0.0.1:/ /mnt/krb5
           mount | grep /mnt/krb5
 
           # ⛔ "it mounted" is not the claim. Check the flavour the kernel
           # recorded: a mount that quietly used sec=sys looks identical from
           # the outside, and this whole lane would then prove nothing.
-          grep -q 'sec=krb5' /proc/mounts || {
-            echo "::error::the mount is not using sec=krb5"; grep /mnt/krb5 /proc/mounts; exit 1; }
+          # The flavour is matched EXACTLY: "sec=krb5" is a prefix of "sec=krb5i",
+          # so a krb5i lane that quietly fell back to krb5 would pass a
+          # substring check and prove the opposite of what it claims.
+          grep -q "sec=${{ matrix.sec }}," /proc/mounts || {
+            echo "::error::the mount is not using sec=${{ matrix.sec }}"; grep /mnt/krb5 /proc/mounts; exit 1; }
 
           test "$(cat /mnt/krb5/HELLO.TXT)" = "authenticated by kerberos"
-          echo "the kernel client read a file over RPCSEC_GSS"
+          echo "the kernel client read a file over RPCSEC_GSS (${{ matrix.sec }})"
 
           sudo umount /mnt/krb5
           echo "unmounted cleanly"

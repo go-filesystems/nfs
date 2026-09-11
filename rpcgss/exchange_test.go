@@ -379,24 +379,14 @@ func TestAForgedVerifierIsRefused(t *testing.T) {
 	}
 }
 
-func TestIntegrityAndPrivacyAreRefusedNotDowngraded(t *testing.T) {
+func TestPrivacyIsRefusedNotDowngraded(t *testing.T) {
 	keytabPath, service := fixture(t)
-	for _, tc := range []struct {
-		name    string
-		service uint32
-	}{
-		{"integrity", 2},
-		{"privacy", 3},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			i := establish(t, server(t, keytabPath), service)
-			i.dataCall(t, 1, tc.service)
-			// Refused, not served as svc_none: a client that asked for
-			// privacy and silently got none would never find out.
-			if got := i.denied(t); got != 13 {
-				t.Errorf("auth_stat = %d, want 13 (RPCSEC_GSS_CREDPROBLEM)", got)
-			}
-		})
+	i := establish(t, server(t, keytabPath), service)
+	i.dataCall(t, 1, 3 /* rpc_gss_svc_privacy */)
+	// Refused, not served as something weaker: a client that asked for
+	// privacy and silently got none would never find out.
+	if got := i.denied(t); got != 13 {
+		t.Errorf("auth_stat = %d, want 13 (RPCSEC_GSS_CREDPROBLEM)", got)
 	}
 }
 
@@ -586,5 +576,118 @@ func TestContextsCountsWhatIsHeld(t *testing.T) {
 	i.reply(t)
 	if n := auth.Contexts(); n != 0 {
 		t.Errorf("after DESTROY the server still holds %d contexts", n)
+	}
+}
+
+// integWrap builds an rpc_gss_integ_data around args, as a krb5i client does.
+func (i *initiator) integWrap(t *testing.T, seq uint32, args func(*xdr.Encoder)) []byte {
+	t.Helper()
+	body := xdr.NewEncoder(nil)
+	body.Uint32(seq)
+	if args != nil {
+		args(body)
+	}
+	e := xdr.NewEncoder(nil)
+	e.Opaque(body.Bytes())
+	e.Opaque(i.mic(t, body.Bytes()))
+	return e.Bytes()
+}
+
+// integUnwrap opens the reply's envelope and checks its signature.
+func (i *initiator) integUnwrap(t *testing.T, seq uint32, d *xdr.Decoder) *xdr.Decoder {
+	t.Helper()
+	d.SetLimit(1 << 20)
+	body, err := d.Opaque()
+	if err != nil {
+		t.Fatalf("the reply is not an integrity envelope: %v", err)
+	}
+	mic, err := d.Opaque()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mt gssapi.MICToken
+	if err := mt.Unmarshal(mic, true); err != nil {
+		t.Fatalf("the reply's checksum does not parse: %v", err)
+	}
+	mt.Payload = body
+	ok, err := mt.Verify(i.key, keyusage.GSSAPI_ACCEPTOR_SIGN)
+	if err != nil || !ok {
+		t.Fatalf("the reply body is not signed by the server: ok=%v err=%v", ok, err)
+	}
+	inner := xdr.NewDecoder(body)
+	got, err := inner.Uint32()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != seq {
+		t.Errorf("the signed reply body carries seq %d, want %d", got, seq)
+	}
+	inner.SetLimit(0)
+	return inner
+}
+
+func TestIntegrityProtectsArgumentsAndResults(t *testing.T) {
+	keytabPath, service := fixture(t)
+	i := establish(t, server(t, keytabPath), service)
+
+	const seq = 11
+	cr := i.cred(0, seq, 2 /* rpc_gss_svc_integrity */)
+	h := i.header(1, cr)
+	i.send(t, h, rpc.Auth{Flavor: rpcgss.Flavor, Body: i.mic(t, h)}, func(e *xdr.Encoder) {
+		e.Fixed(i.integWrap(t, seq, nil))
+	})
+	verf, accept, d := i.reply(t)
+	if accept != 0 {
+		t.Fatalf("accept_stat = %d", accept)
+	}
+	i.verifyServerMIC(t, be32(seq), verf.Body)
+
+	inner := i.integUnwrap(t, seq, d)
+	who, err := inner.String()
+	if err != nil {
+		t.Fatalf("the unwrapped results do not decode: %v", err)
+	}
+	if who == "" {
+		t.Error("the procedure saw no principal")
+	}
+	t.Logf("sec=krb5i: %s, arguments and results both signed", who)
+}
+
+func TestASignedBodyCannotBeMovedOntoAnotherCall(t *testing.T) {
+	keytabPath, service := fixture(t)
+	i := establish(t, server(t, keytabPath), service)
+
+	// Both signatures are genuine: the verifier signs a header built for
+	// sequence 21, and the body was signed for sequence 20. Only comparing
+	// the credential's copy against the one inside the body catches it —
+	// which is why RFC 2203 puts the number in two places.
+	const credSeq, bodySeq = 21, 20
+	cr := i.cred(0, credSeq, 2)
+	h := i.header(1, cr)
+	i.send(t, h, rpc.Auth{Flavor: rpcgss.Flavor, Body: i.mic(t, h)}, func(e *xdr.Encoder) {
+		e.Fixed(i.integWrap(t, bodySeq, nil))
+	})
+	if got := i.denied(t); got != 4 {
+		t.Errorf("auth_stat = %d, want 4 (AUTH_REJECTEDVERF)", got)
+	}
+}
+
+func TestAnAlteredArgumentIsRefused(t *testing.T) {
+	keytabPath, service := fixture(t)
+	i := establish(t, server(t, keytabPath), service)
+
+	const seq = 31
+	cr := i.cred(0, seq, 2)
+	h := i.header(1, cr)
+	env := i.integWrap(t, seq, func(e *xdr.Encoder) { e.Uint32(0xDEADBEEF) })
+	// Flip one bit of the signed body. Under sec=krb5 this call would have
+	// been served: the header signature is untouched, and only integrity
+	// covers what the arguments say.
+	env[len(env)-1] ^= 1
+	i.send(t, h, rpc.Auth{Flavor: rpcgss.Flavor, Body: i.mic(t, h)}, func(e *xdr.Encoder) {
+		e.Fixed(env)
+	})
+	if got := i.denied(t); got != 4 {
+		t.Errorf("auth_stat = %d, want 4 (AUTH_REJECTEDVERF)", got)
 	}
 }
