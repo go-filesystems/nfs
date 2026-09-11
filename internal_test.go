@@ -656,3 +656,59 @@ func TestSetAuthenticatorOnlyBeforeServing(t *testing.T) {
 	}
 	t.Error("SetAuthenticator kept being accepted after Serve started")
 }
+
+// TestMntAnnouncesTheAuthenticatorsFlavour: the Linux client READS the
+// flavour list in the MNT reply and refuses to mount when the sec= it was
+// asked for is absent — before it ever sends an NFS call. A server that
+// authenticates with Kerberos and does not say so here answers "access denied
+// by server", which names neither the list nor the flavour. It cost a CI run.
+func TestMntAnnouncesTheAuthenticatorsFlavour(t *testing.T) {
+	read := func(t *testing.T, s *Server) []uint32 {
+		t.Helper()
+		e := xdr.NewEncoder(nil)
+		e.String("/")
+		_, d := invoke(s.procMnt, e.Bytes())
+		if got, _ := d.Uint32(); got != mountOK {
+			t.Fatalf("MNT = %d, want MNT3ERR_OK", got)
+		}
+		d.SetLimit(64)
+		if _, err := d.Opaque(); err != nil { // the root handle
+			t.Fatal(err)
+		}
+		n, err := d.Uint32()
+		if err != nil {
+			t.Fatal(err)
+		}
+		flavours := make([]uint32, 0, n)
+		for range n {
+			f, err := d.Uint32()
+			if err != nil {
+				t.Fatal(err)
+			}
+			flavours = append(flavours, f)
+		}
+		return flavours
+	}
+
+	t.Run("without an authenticator", func(t *testing.T) {
+		s, _ := newTestServer(t)
+		if got := read(t, s); len(got) != 2 || got[0] != rpc.AuthUnix || got[1] != rpc.AuthNull {
+			t.Errorf("flavours = %v, want [AUTH_UNIX AUTH_NULL]", got)
+		}
+	})
+	t.Run("with one", func(t *testing.T) {
+		s, _ := newTestServer(t)
+		if err := s.SetAuthenticator(stubAuth{}); err != nil {
+			t.Fatal(err)
+		}
+		got := read(t, s)
+		if len(got) != 3 {
+			t.Fatalf("flavours = %v, want three", got)
+		}
+		// The stronger flavour first: a client choosing for itself should
+		// land on the one that proves something.
+		if got[0] != 6 || got[1] != rpc.AuthUnix || got[2] != rpc.AuthNull {
+			t.Errorf("flavours = %v, want [RPCSEC_GSS AUTH_UNIX AUTH_NULL]", got)
+		}
+	})
+}

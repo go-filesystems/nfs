@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/go-filesystems/nfs"
 	"github.com/go-filesystems/nfs/fat32demo/demo"
 	"github.com/go-filesystems/nfs/xdr"
+	"github.com/jcmturner/gokrb5/v8/keytab"
 )
 
 // makeImage formats a real FAT32 image and puts one known file in it.
@@ -417,4 +419,72 @@ func TestPositionalWriteAgreesWithWholeFileWrite(t *testing.T) {
 	if !bytes.Equal(results[false], results[true]) {
 		t.Fatal("the positional and whole-file write paths produced different images")
 	}
+}
+
+// writeKeytab builds a keytab on disk without a KDC.
+//
+// A keytab is a file format, not a conversation: gokrb5 can derive a key from
+// a password and write one. That keeps this module's tests free of a Kerberos
+// realm — the realm belongs to the tests of the code that VERIFIES tickets,
+// not to a demo that merely passes a path along.
+func writeKeytab(t *testing.T) string {
+	t.Helper()
+	kt := keytab.New()
+	if err := kt.AddEntry("nfs/localhost", "FLEET.TEST", "unused", time.Now(), 1, 18); err != nil {
+		t.Fatalf("AddEntry: %v", err)
+	}
+	b, err := kt.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "service.keytab")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestKeytabOption: -keytab turns on sec=krb5 and says so, and a keytab that
+// cannot be read stops the server rather than serving without the
+// authentication the operator asked for. The second half is the one that
+// matters: a server that shrugged at a missing keytab would answer AUTH_UNIX
+// mounts happily, and look exactly like one that was working.
+func TestKeytabOption(t *testing.T) {
+	path, _ := makeImage(t)
+
+	t.Run("a keytab that cannot be read stops the server", func(t *testing.T) {
+		var out bytes.Buffer
+		_, _, err := demo.SetupOpts(path, "127.0.0.1:0", false, false, &out,
+			demo.Keytab(filepath.Join(t.TempDir(), "absent.keytab")))
+		if err == nil {
+			t.Fatal("a missing keytab was accepted")
+		}
+	})
+
+	t.Run("a readable one is announced", func(t *testing.T) {
+		var out bytes.Buffer
+		srv, ln, err := demo.SetupOpts(path, "127.0.0.1:0", false, false, &out,
+			demo.Keytab(writeKeytab(t)))
+		if err != nil {
+			t.Fatalf("SetupOpts: %v", err)
+		}
+		defer srv.Close()
+		defer ln.Close()
+		if !strings.Contains(out.String(), "sec=krb5 accepted") {
+			t.Errorf("the server did not announce sec=krb5:\n%s", out.String())
+		}
+		// ⛔ And it must say that sec=sys is STILL accepted. Kerberos here is
+		// an addition, not a restriction, and a demo implying otherwise would
+		// be the most misleading thing in this repository.
+		if !strings.Contains(out.String(), "sec=sys still accepted") {
+			t.Errorf("the server did not say sec=sys is still accepted:\n%s", out.String())
+		}
+	})
+
+	t.Run("Main passes the flag through", func(t *testing.T) {
+		var out, errOut bytes.Buffer
+		if rc := demo.Main([]string{"-image", path, "-keytab", "/nonexistent.keytab"}, &out, &errOut); rc != 1 {
+			t.Fatalf("Main with an unreadable keytab = %d, want 1", rc)
+		}
+	})
 }

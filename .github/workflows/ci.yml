@@ -353,7 +353,10 @@ jobs:
           echo "--- bytes must match what the driver holds ---"
           test "$(cat /mnt/live/HELLO.TXT)" = "hello from a real image"
           nfs_sum=$(sha256sum < /mnt/live/SUB/BIG.BIN | cut -d' ' -f1)
-          want=$(python3 -c "import hashlib;print(hashlib.sha256(b'0123456789abcdef'*8192).hexdigest())")
+          # The expected digest is computed with the same shell tool that reads
+          # it back, not with a second language: a judge and its subject must
+          # count alike, and this repository's tooling is Go and shell.
+          want=$(for i in $(seq 1 8192); do printf '0123456789abcdef'; done | sha256sum | cut -d' ' -f1)
           echo "over NFS: $nfs_sum"
           echo "expected: $want"
           test "$nfs_sum" = "$want"
@@ -480,8 +483,8 @@ jobs:
             sudo dd if=/dev/urandom of=/mnt/bench/TARGET.BIN bs=64k count=$((MIB * 16)) \
               oflag=direct conv=notrunc status=none
             end=$(date +%s.%N)
-            secs=$(python3 -c "print(f'{$end-$start:.2f}')")
-            rate=$(python3 -c "print(f'{$MIB*1024*1024/($end-$start)/1000:.0f}')")
+            secs=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.2f", b-a}')
+            rate=$(awk -v m="$MIB" -v s="$secs" 'BEGIN{printf "%.0f", m*1024*1024/s/1000}')
             echo "RESULT $label: $MIB MiB in 64 KiB blocks took ${secs}s (${rate} kB/s)"
             echo "$secs" > "/tmp/bench/secs.$MIB.$tag"
             sudo umount /mnt/bench
@@ -512,14 +515,16 @@ jobs:
           # is itself the reason the job measures two sizes.
           before=$(cat /tmp/bench/secs.8.before)
           after=$(cat /tmp/bench/secs.8.after)
-          python3 - "$before" "$after" <<'PY'
-          import sys
-          before, after = float(sys.argv[1]), float(sys.argv[2])
-          ratio = before / after
-          print(f"8 MiB: whole-file {before}s / positional {after}s = {ratio:.1f}x")
-          if ratio < 5:
-              raise SystemExit(f"FAIL: the positional write is only {ratio:.1f}x faster; it must be at least 5x")
-          PY
+          awk -v b="$before" -v a="$after" '
+            BEGIN {
+              if (a+0 <= 0) { print "FAIL: the positional arm took no measurable time"; exit 1 }
+              r = b / a
+              printf "8 MiB: whole-file %ss / positional %ss = %.1fx\n", b, a, r
+              # Written as an explicit exit rather than a condition on the
+              # last statement: awk'"'"'s status becomes the step'"'"'s, and a lane
+              # comfortably above its threshold has failed that way before.
+              if (r < 5) { printf "FAIL: the positional write is only %.1fx faster; it must be at least 5x\n", r; exit 1 }
+            }'
 
       - name: A soft,timeo=50 mount must survive the write it used to fail
         working-directory: nfs/fat32demo
@@ -545,3 +550,127 @@ jobs:
           test "$(stat -c %s /mnt/soft/TARGET.BIN)" -eq 2097152
           echo "soft,timeo=50 completed 2 MiB with no EIO"
           sudo umount /mnt/soft
+
+  # ----------------------------------------------------------------------
+  # The judge for RFC 2203. Everything else about RPCSEC_GSS in this
+  # repository is checked against an initiator written in its own tests,
+  # which can only ever confirm this repository's reading of the RFC. The
+  # Linux kernel's NFS client read it independently, years earlier, and it
+  # refuses what it does not recognise.
+  # ----------------------------------------------------------------------
+  live-mount-krb5:
+    name: live mount with Kerberos (linux kernel client)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: nfs
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/fat32demo/go.mod
+
+      - name: Install the NFS client and MIT Kerberos
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nfs-common krb5-kdc krb5-admin-server krb5-user
+
+      - name: A throwaway realm, visible to rpc.gssd
+        working-directory: nfs
+        run: |
+          set -euo pipefail
+          timeout 300 ./test/kdc.sh "$RUNNER_TEMP/krb5"
+          cat "$RUNNER_TEMP/krb5/env" >> "$GITHUB_ENV"
+          set -a; . "$RUNNER_TEMP/krb5/env"; set +a
+          # rpc.gssd is a daemon, not a library call: it reads the SYSTEM
+          # configuration and the machine keytab, and never sees KRB5_CONFIG.
+          sudo cp "$KRB5_CONFIG" /etc/krb5.conf
+          # It authenticates the MACHINE, so the realm needs a host principal
+          # and /etc/krb5.keytab has to hold it.
+          fqdn=$(hostname -f 2>/dev/null || hostname)
+          for p in "host/$fqdn" "host/localhost" "root/$fqdn"; do
+            sudo kadmin.local -r FLEET.TEST -q "addprinc -randkey $p" >/dev/null
+            sudo kadmin.local -r FLEET.TEST -q "ktadd -k /etc/krb5.keytab $p" >/dev/null
+          done
+          sudo chmod 600 /etc/krb5.keytab
+          # rpc.gssd is run in the FOREGROUND and verbose, into a log. The
+          # packaged unit is silent, and "access denied by server" is the
+          # same message whether the client never got a ticket or the server
+          # refused one — two opposite faults behind one sentence.
+          sudo systemctl stop rpc-gssd 2>/dev/null || true
+          sudo setsid /usr/sbin/rpc.gssd -vvv -f </dev/null > /tmp/gssd.log 2>&1 &
+          sleep 2
+          pgrep -a rpc.gssd
+          sudo klist -k /etc/krb5.keytab
+
+      - name: Build an image, serve it with sec=krb5, mount it
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/live ./mkimg
+          cat > ./mkimg/main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+
+              fat32 "github.com/go-filesystems/fat32"
+          )
+
+          func main() {
+              fs, err := fat32.Format("/tmp/live/disk.img", 16<<20, fat32.FormatConfig{Label: "KRB5"})
+              if err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.WriteFile("/HELLO.TXT", []byte("authenticated by kerberos\n"), 0o644); err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.Close(); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go run -mod=mod ./mkimg
+          rm -rf ./mkimg
+
+          go build -mod=mod -o /tmp/live/fat32demo .
+          /tmp/live/fat32demo -image /tmp/live/disk.img -addr 127.0.0.1:12049 \
+            -keytab "$KRB5_TEST_KEYTAB" > /tmp/live/server.log 2>&1 &
+          demo_pid=$!
+          # Whatever happens, print the three logs that split the fault apart:
+          # the KDC says whether the client ever ASKED for a service ticket,
+          # gssd says what it did with one, and the server says what arrived.
+          diagnose() {
+            echo "::group::the KDC log"; sudo cat "$KRB5_TEST_DIR/kdc.log" 2>/dev/null | tail -40; echo "::endgroup::"
+            echo "::group::rpc.gssd"; sudo cat /tmp/gssd.log 2>/dev/null | tail -60; echo "::endgroup::"
+            echo "::group::the server"; cat /tmp/live/server.log 2>/dev/null; echo "::endgroup::"
+          }
+          trap 'sudo umount -f /mnt/krb5 2>/dev/null || true; kill $demo_pid 2>/dev/null || true; diagnose' EXIT
+          for i in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/12049) 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+
+          sudo mkdir -p /mnt/krb5
+          # sec=krb5 is the whole point: the kernel client will not fall back,
+          # so a mount that succeeds is a mount RPCSEC_GSS carried.
+          sudo mount -t nfs -o vers=3,tcp,sec=krb5,port=12049,mountport=12049,nolock,hard,timeo=600 \
+            127.0.0.1:/ /mnt/krb5
+          mount | grep /mnt/krb5
+
+          # ⛔ "it mounted" is not the claim. Check the flavour the kernel
+          # recorded: a mount that quietly used sec=sys looks identical from
+          # the outside, and this whole lane would then prove nothing.
+          grep -q 'sec=krb5' /proc/mounts || {
+            echo "::error::the mount is not using sec=krb5"; grep /mnt/krb5 /proc/mounts; exit 1; }
+
+          test "$(cat /mnt/krb5/HELLO.TXT)" = "authenticated by kerberos"
+          echo "the kernel client read a file over RPCSEC_GSS"
+
+          sudo umount /mnt/krb5
+          echo "unmounted cleanly"

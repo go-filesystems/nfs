@@ -19,9 +19,11 @@ import (
 	"net"
 	"os"
 
+	"github.com/go-authn/krb5"
 	fat32 "github.com/go-filesystems/fat32"
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/nfs"
+	"github.com/go-filesystems/nfs/rpcgss"
 )
 
 // newServer is [nfs.New], indirected so the two failure paths in Setup that
@@ -65,7 +67,7 @@ type wholeFileOnly struct{ filesystem.Filesystem }
 // SetupOpts is [Setup] with the measurement switch. Pass noPositional to serve
 // the image as if the driver had no Opener/WritableFile capability at all; see
 // [wholeFileOnly].
-func SetupOpts(image, addr string, readWrite, noPositional bool, out io.Writer) (*nfs.Server, net.Listener, error) {
+func SetupOpts(image, addr string, readWrite, noPositional bool, out io.Writer, opts ...Option) (*nfs.Server, net.Listener, error) {
 	fi, err := os.Stat(image)
 	if err != nil {
 		return nil, nil, err
@@ -87,11 +89,15 @@ func SetupOpts(image, addr string, readWrite, noPositional bool, out io.Writer) 
 		exported = wholeFileOnly{fsys}
 		fmt.Fprintln(out, "positional read/write DISABLED: serving through ReadFile/WriteFile only")
 	}
-	opts := []nfs.ExportOption{nfs.WithCapacity(uint64(fi.Size()), 0)}
+	exportOpts := []nfs.ExportOption{nfs.WithCapacity(uint64(fi.Size()), 0)}
 	if readWrite {
-		opts = append(opts, nfs.ReadWrite())
+		exportOpts = append(exportOpts, nfs.ReadWrite())
 	}
-	if err := srv.Export("/", exported, opts...); err != nil {
+	if err := applyAuth(srv, opts, out); err != nil {
+		fsys.Close()
+		return nil, nil, err
+	}
+	if err := srv.Export("/", exported, exportOpts...); err != nil {
 		fsys.Close()
 		return nil, nil, err
 	}
@@ -117,10 +123,16 @@ func Main(args []string, out, errOut io.Writer) int {
 	rw := fs.Bool("rw", false, "export read-write (default read-only)")
 	noPositional := fs.Bool("no-positional", false,
 		"hide the driver's Opener/WritableFile capabilities, forcing whole-file reads and writes (for A/B measurement)")
+	keytab := fs.String("keytab", "",
+		"accept sec=krb5 mounts using the service principals in this keytab (sec=sys stays accepted too)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	srv, ln, err := SetupOpts(*image, *addr, *rw, *noPositional, out)
+	var opts []Option
+	if *keytab != "" {
+		opts = append(opts, Keytab(*keytab))
+	}
+	srv, ln, err := SetupOpts(*image, *addr, *rw, *noPositional, out, opts...)
 	if err != nil {
 		fmt.Fprintln(errOut, "fat32demo:", err)
 		return 1
@@ -128,4 +140,43 @@ func Main(args []string, out, errOut io.Writer) int {
 	defer srv.Close()
 	fmt.Fprintln(errOut, "fat32demo:", srv.Serve(ln))
 	return 1
+}
+
+// Option configures the served server beyond the positional arguments.
+//
+// It is variadic rather than a sixth parameter so that callers written before
+// there was anything to configure keep compiling.
+type Option func(*settings)
+
+type settings struct{ keytab string }
+
+// Keytab makes the server accept sec=krb5 mounts, using the service
+// principals in the keytab at path.
+//
+// It does NOT make Kerberos mandatory: AUTH_UNIX stays acceptable alongside,
+// which is what nfs.Server.SetAuthenticator documents. A demo that implied
+// otherwise would be the most misleading thing in this repository.
+func Keytab(path string) Option { return func(s *settings) { s.keytab = path } }
+
+// applyAuth is called from SetupOpts once the server exists.
+func applyAuth(srv *nfs.Server, opts []Option, out io.Writer) error {
+	var s settings
+	for _, o := range opts {
+		o(&s)
+	}
+	if s.keytab == "" {
+		return nil
+	}
+	a, err := krb5.Load(s.keytab)
+	if err != nil {
+		return err
+	}
+	// Announced only on success, and after the fact: SetAuthenticator refuses
+	// a server that is already serving, and a line saying Kerberos is on
+	// would then be the last thing an operator read before it was not.
+	err = srv.SetAuthenticator(rpcgss.New(a))
+	if err == nil {
+		fmt.Fprintf(out, "sec=krb5 accepted (keytab %s); sec=sys still accepted\n", s.keytab)
+	}
+	return err
 }

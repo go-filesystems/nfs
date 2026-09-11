@@ -91,6 +91,9 @@ mkdir -p "$DIR/db"
     echo "    }"
     echo "[domain_realm]"
     echo "    localhost = $REALM"
+    if [ -n "${DOMAIN:-}" ]; then
+        echo "    localhost.$DOMAIN = $REALM"
+    fi
     echo "    $SHORT = $REALM"
     echo "    $FQDN = $REALM"
     if [ -n "${DOMAIN:-}" ]; then
@@ -119,7 +122,16 @@ run kdb5_util create -s -r "$REALM" -P masterkey </dev/null >/dev/null
 ka() { run kadmin.local -r "$REALM" -q "$1" </dev/null >/dev/null 2>&1; }
 say "adding principals"
 ka "addprinc -pw $USER_PW alice@$REALM"
-for host in localhost "$SHORT" "$FQDN"; do
+# The names a client may canonicalise to, not the ones we had in mind. A
+# resolver with a search domain turns "localhost" into "localhost.<domain>",
+# and on a GitHub runner that domain is a per-VM string nobody could have
+# guessed: the KDC then answers "Server not found in Kerberos database" for a
+# principal whose name appears nowhere in this script.
+HOSTS="localhost $SHORT $FQDN"
+if [ -n "${DOMAIN:-}" ]; then
+    HOSTS="$HOSTS localhost.$DOMAIN"
+fi
+for host in $HOSTS; do
     ka "addprinc -randkey $SERVICE/$host@$REALM"
     ka "ktadd -k $DIR/service.keytab $SERVICE/$host@$REALM"
 done

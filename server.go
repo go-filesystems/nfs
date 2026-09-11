@@ -355,3 +355,12 @@ func (s *Server) SetAuthenticator(a rpc.Authenticator) error {
 	s.rpcsrv.Auth = a
 	return nil
 }
+
+// authFlavor is the extra credential flavour this server accepts, if any.
+// MOUNT has to announce it; see procMnt.
+func (s *Server) authFlavor() (uint32, bool) {
+	if s.rpcsrv.Auth == nil {
+		return 0, false
+	}
+	return s.rpcsrv.Auth.Flavor(), true
+}

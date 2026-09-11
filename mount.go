@@ -49,12 +49,25 @@ func (s *Server) procMnt(c *rpc.Call) rpc.Status {
 	}
 	c.Res.Uint32(mountOK)
 	c.Res.Opaque(h)
-	// The auth flavours the client may use. AUTH_UNIX is listed first
-	// because every client offers it; AUTH_NULL is listed because this
-	// server genuinely does not read the credential (see the package
-	// security note), so refusing an unauthenticated client would be
-	// theatre.
-	c.Res.Uint32(2)
+	// The auth flavours the client may use.
+	//
+	// This is not documentation: the Linux client READS this list and
+	// refuses to mount when the sec= it was asked for is absent, before it
+	// ever sends an NFS call. A server that authenticates with Kerberos but
+	// does not SAY so here answers "access denied by server", which names
+	// neither the list nor the flavour.
+	//
+	// The stronger flavour goes first: a client choosing for itself should
+	// land on the one that proves something. AUTH_UNIX follows because
+	// every client offers it, and AUTH_NULL because this server genuinely
+	// does not read that credential (see the package security note), so
+	// refusing an unauthenticated client would be theatre.
+	if f, ok := s.authFlavor(); ok {
+		c.Res.Uint32(3)
+		c.Res.Uint32(f)
+	} else {
+		c.Res.Uint32(2)
+	}
 	c.Res.Uint32(rpc.AuthUnix)
 	c.Res.Uint32(rpc.AuthNull)
 	return rpc.StatusSuccess
