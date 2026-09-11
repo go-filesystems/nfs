@@ -131,6 +131,12 @@ type callHeader struct {
 	proc uint32
 	cred Auth
 	verf Auth
+	// credEnd is the offset just past the credential. RFC 2203 §5.3.1 signs
+	// the header from the xid to exactly there, so the range is recorded
+	// while decoding rather than reconstructed afterwards: re-encoding what
+	// was decoded produces equivalent XDR, not the same bytes, and a
+	// signature does not care about equivalent.
+	credEnd int
 }
 
 // errNotCall reports a message whose type is not CALL. A server has nothing
@@ -158,7 +164,7 @@ func decodeAuth(d *xdr.Decoder) (Auth, error) {
 
 // decodeCall parses the call header, leaving the decoder positioned at the
 // procedure arguments.
-func decodeCall(d *xdr.Decoder) (callHeader, error) {
+func decodeCall(d *xdr.Decoder, total int) (callHeader, error) {
 	var h callHeader
 	var err error
 	if h.xid, err = d.Uint32(); err != nil {
@@ -190,6 +196,7 @@ func decodeCall(d *xdr.Decoder) (callHeader, error) {
 	if h.cred, err = decodeAuth(d); err != nil {
 		return h, err
 	}
+	h.credEnd = total - d.Remaining()
 	if h.verf, err = decodeAuth(d); err != nil {
 		return h, err
 	}
@@ -199,16 +206,19 @@ func decodeCall(d *xdr.Decoder) (callHeader, error) {
 	return h, nil
 }
 
-// encodeAccepted writes the header of an accepted reply and returns the
-// encoder so the caller can append results. Results follow only for
-// stSuccess; every other accept_stat is complete as written, except
+// encodeAccepted writes the header of an accepted reply. Results follow only
+// for stSuccess; every other accept_stat is complete as written, except
 // PROG_MISMATCH which appends its supported version range.
-func encodeAccepted(e *xdr.Encoder, xid, stat uint32) {
+//
+// The verifier is a parameter rather than always authNone because RPCSEC_GSS
+// puts a signature there: under that flavour a null verifier is not a
+// formality a client overlooks, it is a reply the client discards.
+func encodeAccepted(e *xdr.Encoder, xid, stat uint32, verf Auth) {
 	e.Uint32(xid)
 	e.Uint32(msgReply)
 	e.Uint32(msgAccepted)
-	e.Uint32(authNone.Flavor)
-	e.Opaque(authNone.Body)
+	e.Uint32(verf.Flavor)
+	e.Opaque(verf.Body)
 	e.Uint32(stat)
 }
 

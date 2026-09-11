@@ -40,6 +40,13 @@ type Call struct {
 	Prog, Vers, Proc uint32
 	// Cred is the raw credential. It is unauthenticated; see [UnixCred].
 	Cred Auth
+	// Principal is who the client PROVED itself to be, or empty when the
+	// flavour proves nothing — which is every flavour but RPCSEC_GSS.
+	//
+	// Empty and "root" are different answers. A procedure that treats an
+	// unauthenticated call as anonymous is making a policy decision, and it
+	// should make it deliberately rather than by reading Cred.UID.
+	Principal string
 	// Args decodes the procedure arguments.
 	Args *xdr.Decoder
 	// Res encodes the procedure results.
@@ -93,6 +100,13 @@ var errRecordTooLarge = errors.New("rpc: record too large")
 type Server struct {
 	// MaxRecord caps one RPC record in bytes. Zero means maxRecordDefault.
 	MaxRecord int
+
+	// Auth evaluates one further credential flavour — RPCSEC_GSS is the
+	// reason it exists. Nil means AUTH_NULL and AUTH_UNIX and nothing else,
+	// which is this server's behaviour when nobody asks for more.
+	//
+	// Set it before Serve: it is read without a lock on every call.
+	Auth Authenticator
 
 	mu       sync.Mutex
 	programs map[uint64]*Program
@@ -281,7 +295,7 @@ func writeRecord(w io.Writer, body, scratch []byte) ([]byte, error) {
 func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 	d := xdr.NewDecoder(req)
 	e := xdr.NewEncoder(res)
-	h, err := decodeCall(d)
+	h, err := decodeCall(d, len(req))
 	if err != nil {
 		if errors.Is(err, errBadRPCVersion) {
 			// The xid was decoded before the version check failed, so the
@@ -292,7 +306,32 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 		return nil, err
 	}
 
-	if h.cred.Flavor != AuthNull && h.cred.Flavor != AuthUnix {
+	// Which flavours this server evaluates, and what it does with the rest.
+	// AUTH_NULL and AUTH_UNIX prove nothing and are accepted as they arrive;
+	// see [UnixCred] for why "accepted" is not "believed".
+	verf, principal := authNone, ""
+	switch {
+	case h.cred.Flavor == AuthNull || h.cred.Flavor == AuthUnix:
+	case s.Auth != nil && h.cred.Flavor == s.Auth.Flavor():
+		dec := s.Auth.Authenticate(&AuthCall{
+			XID: h.xid, Prog: h.prog, Vers: h.vers, Proc: h.proc,
+			Cred: h.cred, Verf: h.verf, Header: req[:h.credEnd],
+			Args: d, Remote: remote,
+		})
+		if dec.Reject != 0 {
+			encodeDenied(e, h.xid, rjAuthError, dec.Reject, 0)
+			return e.Bytes(), nil
+		}
+		verf, principal = dec.Verf, dec.Principal
+		if dec.Reply != nil {
+			// Context establishment: the call reached a procedure number but
+			// belongs to the flavour, not to the program. Dispatching it
+			// would hand NULLPROC a token it has no idea about.
+			encodeAccepted(e, h.xid, stSuccess, verf)
+			dec.Reply(e)
+			return e.Bytes(), nil
+		}
+	default:
 		// AUTH_TOOWEAK (auth_stat 5): the client offered a flavour this
 		// server cannot evaluate. Saying so lets it retry with AUTH_UNIX
 		// instead of retransmitting forever.
@@ -304,32 +343,32 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 	switch {
 	case prog != nil:
 	case progExists:
-		encodeAccepted(e, h.xid, stProgMismatch)
+		encodeAccepted(e, h.xid, stProgMismatch, authNone)
 		e.Uint32(lo)
 		e.Uint32(hi)
 		return e.Bytes(), nil
 	default:
-		encodeAccepted(e, h.xid, stProgUnavail)
+		encodeAccepted(e, h.xid, stProgUnavail, authNone)
 		return e.Bytes(), nil
 	}
 
 	proc, ok := prog.Procs[h.proc]
 	if !ok {
-		encodeAccepted(e, h.xid, stProcUnavail)
+		encodeAccepted(e, h.xid, stProcUnavail, authNone)
 		return e.Bytes(), nil
 	}
 
-	encodeAccepted(e, h.xid, stSuccess)
+	encodeAccepted(e, h.xid, stSuccess, verf)
 	st := proc(&Call{
 		XID: h.xid, Prog: h.prog, Vers: h.vers, Proc: h.proc,
-		Cred: h.cred, Args: d, Res: e, Remote: remote,
+		Cred: h.cred, Principal: principal, Args: d, Res: e, Remote: remote,
 	})
 	if st != StatusSuccess {
 		// Rewind past whatever the procedure had already written. The header
 		// is fixed-size and identical for every accept_stat, so re-encoding
 		// from zero is exact rather than a patch-up.
 		e.Truncate(0)
-		encodeAccepted(e, h.xid, uint32(st))
+		encodeAccepted(e, h.xid, uint32(st), verf)
 	}
 	return e.Bytes(), nil
 }

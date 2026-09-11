@@ -27,6 +27,10 @@ var (
 	// ErrNoExports reports Serve called with nothing exported. Starting
 	// such a server would accept mounts it can only answer with errors.
 	ErrNoExports = errors.New("nfs: no exports")
+	// ErrServing reports a change to a server that is already running. It is
+	// refused rather than applied: a client that mounted a moment earlier
+	// would be on the old configuration with no way to tell.
+	ErrServing = errors.New("nfs: server is already serving")
 )
 
 // export is one exported filesystem.
@@ -325,4 +329,29 @@ func statusFor(err error, fallback Status) Status {
 		}
 	}
 	return fallback
+}
+
+// SetAuthenticator makes this server accept one further credential flavour,
+// which in practice means Kerberos: see
+// [github.com/go-filesystems/nfs/rpcgss].
+//
+// Without it the server accepts AUTH_NULL and AUTH_UNIX, where a client
+// asserts a uid and nothing can disagree. With it, calls carrying that
+// flavour are authenticated, and [github.com/go-filesystems/nfs/rpc.Call]
+// carries who the caller proved itself to be.
+//
+// It does NOT stop AUTH_UNIX from being accepted as well. An export that must
+// refuse everything but Kerberos is a policy this module does not yet
+// express, and saying so is better than implying a guarantee: a mount that
+// silently fell back to AUTH_UNIX would look exactly like one that did not.
+//
+// Call it before Serve.
+func (s *Server) SetAuthenticator(a rpc.Authenticator) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return ErrServing
+	}
+	s.rpcsrv.Auth = a
+	return nil
 }
