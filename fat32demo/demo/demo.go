@@ -171,9 +171,12 @@ func applyAuth(srv *nfs.Server, opts []Option, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := srv.SetAuthenticator(rpcgss.New(a)); err != nil {
-		return err
+	// Announced only on success, and after the fact: SetAuthenticator refuses
+	// a server that is already serving, and a line saying Kerberos is on
+	// would then be the last thing an operator read before it was not.
+	err = srv.SetAuthenticator(rpcgss.New(a))
+	if err == nil {
+		fmt.Fprintf(out, "sec=krb5 accepted (keytab %s); sec=sys still accepted\n", s.keytab)
 	}
-	fmt.Fprintf(out, "sec=krb5 accepted (keytab %s); sec=sys still accepted\n", s.keytab)
-	return nil
+	return err
 }
