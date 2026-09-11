@@ -153,10 +153,10 @@ func (s *Server) data(c *rpc.AuthCall, cr cred) rpc.AuthDecision {
 		s.drop(cr.handle)
 		return rpc.AuthDecision{Reject: statCtxProblem}
 	}
-	if cr.service != svcNone {
-		// Integrity and privacy are refused rather than served as svc_none.
-		// A client that asked for privacy and silently got none would have
-		// no way to find out.
+	if cr.service != svcNone && cr.service != svcIntegrity {
+		// Privacy is refused rather than served as something weaker. A
+		// client that asked for it and silently got none would have no way
+		// to find out.
 		return rpc.AuthDecision{Reject: statCredProblem}
 	}
 	if c.Verf.Flavor != Flavor {
@@ -187,6 +187,19 @@ func (s *Server) data(c *rpc.AuthCall, cr cred) rpc.AuthDecision {
 	dec := rpc.AuthDecision{
 		Verf:      rpc.Auth{Flavor: Flavor, Body: verf},
 		Principal: ctx.gss.Principal(),
+	}
+	if cr.service == svcIntegrity && cr.proc == procData {
+		inner, err := ctx.unwrapArgs(c.Args, cr.seq)
+		if err != nil {
+			// The envelope is signed by the same key as the verifier that
+			// already checked out, so a failure here is not a bad context:
+			// it is a body that does not belong to this call.
+			return rpc.AuthDecision{Reject: 4} // AUTH_REJECTEDVERF
+		}
+		dec.Args = inner
+		dec.WrapResults = func(results []byte) []byte {
+			return ctx.wrapResults(cr.seq, results)
+		}
 	}
 	if cr.proc == procDestroy {
 		s.drop(cr.handle)

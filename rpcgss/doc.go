@@ -9,15 +9,19 @@
 //
 // # What it implements
 //
-// rpc_gss_svc_none, which is sec=krb5: the arguments and results travel as
-// they always did, and what the signature protects is the header — the
-// program, the procedure, the credential and the sequence number. A call
-// cannot be replayed, redirected to another procedure, or attributed to
-// somebody else.
+// rpc_gss_svc_none, which is sec=krb5: what the signature protects is the
+// header — the program, the procedure, the credential and the sequence
+// number. A call cannot be replayed, redirected to another procedure, or
+// attributed to somebody else.
 //
-// It does NOT implement rpc_gss_svc_integrity (sec=krb5i) or
-// rpc_gss_svc_privacy (sec=krb5p), and it refuses a call asking for either
-// rather than quietly serving it with less protection than the client
-// believes it has. That refusal is the point: a client that asked for
-// privacy and got none would never find out.
+// rpc_gss_svc_integrity, which is sec=krb5i: the arguments and results are
+// signed as well, so a file handle or a block of data cannot be altered in
+// flight. The sequence number then appears TWICE, once in the credential and
+// once inside the signed body, and comparing the two is what catches a signed
+// body moved onto another call's header.
+//
+// It does NOT implement rpc_gss_svc_privacy (sec=krb5p), and it refuses a
+// call asking for it rather than quietly serving it with less protection than
+// the client believes it has. That refusal is the point: a client that asked
+// for privacy and got none would never find out.
 package rpcgss

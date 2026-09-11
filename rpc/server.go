@@ -310,6 +310,7 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 	// AUTH_NULL and AUTH_UNIX prove nothing and are accepted as they arrive;
 	// see [UnixCred] for why "accepted" is not "believed".
 	verf, principal := authNone, ""
+	var wrap func([]byte) []byte
 	switch {
 	case h.cred.Flavor == AuthNull || h.cred.Flavor == AuthUnix:
 	case s.Auth != nil && h.cred.Flavor == s.Auth.Flavor():
@@ -322,7 +323,14 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 			encodeDenied(e, h.xid, rjAuthError, dec.Reject, 0)
 			return e.Bytes(), nil
 		}
-		verf, principal = dec.Verf, dec.Principal
+		verf, principal, wrap = dec.Verf, dec.Principal, dec.WrapResults
+		if dec.Args != nil {
+			// The procedure reads what the authenticator unwrapped, not
+			// what arrived: under sec=krb5i the arguments on the wire are
+			// an envelope, and handing the procedure the envelope would
+			// have it decode a length where it expects a file handle.
+			d = dec.Args
+		}
 		if dec.Reply != nil {
 			// Context establishment: the call reached a procedure number but
 			// belongs to the flavour, not to the program. Dispatching it
@@ -359,6 +367,7 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 	}
 
 	encodeAccepted(e, h.xid, stSuccess, verf)
+	results := e.Len()
 	st := proc(&Call{
 		XID: h.xid, Prog: h.prog, Vers: h.vers, Proc: h.proc,
 		Cred: h.cred, Principal: principal, Args: d, Res: e, Remote: remote,
@@ -369,6 +378,15 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 		// from zero is exact rather than a patch-up.
 		e.Truncate(0)
 		encodeAccepted(e, h.xid, uint32(st), verf)
+		return e.Bytes(), nil
+	}
+	if wrap != nil {
+		// Only a successful reply carries results to wrap. Wrapping an
+		// empty body would produce an envelope around nothing, which is
+		// not what any client unwraps.
+		out := wrap(e.Bytes()[results:])
+		e.Truncate(results)
+		e.Fixed(out)
 	}
 	return e.Bytes(), nil
 }

@@ -88,4 +88,26 @@ type AuthDecision struct {
 	// procedure as [Call.Principal]. It is empty for flavours that prove
 	// nothing, which is every flavour but this one.
 	Principal string
+
+	// Args, when non-nil, is what the procedure reads its arguments from
+	// instead of the wire. An authenticator that unwraps returns the
+	// decoder over what it unwrapped.
+	Args *xdr.Decoder
+
+	// WrapResults, when non-nil, transforms what the procedure wrote before
+	// it goes out. It is called only for a successful reply: an accept_stat
+	// other than SUCCESS carries no results to wrap, and wrapping the empty
+	// string would produce a reply no client expects.
+	//
+	// The bytes handed over alias the reply buffer and stop being valid
+	// when it returns; the result is appended verbatim, so it must already
+	// be XDR — a multiple of four bytes.
+	WrapResults func(results []byte) []byte
 }
+
+// The two fields below exist for rpc_gss_svc_integrity (sec=krb5i), where the
+// arguments and results do not travel as themselves: each is wrapped in an
+// rpc_gss_integ_data carrying a sequence number and a signature over both
+// (RFC 2203 §5.3.2). Without them an authenticator can decide WHETHER a call
+// proceeds and not WHAT the procedure reads, which is half of what integrity
+// means.

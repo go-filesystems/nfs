@@ -159,3 +159,63 @@ func onlyHandle(t *testing.T, s *Server) []byte {
 	}
 	return nil
 }
+
+// envelope builds an rpc_gss_integ_data the way a client does, using the fake
+// context's MIC so the signature checks out.
+func envelope(f *fakeContext, seq uint32, extra []byte) []byte {
+	body := xdr.NewEncoder(nil)
+	body.Uint32(seq)
+	body.Fixed(extra)
+	mic, _ := f.MIC(body.Bytes())
+	e := xdr.NewEncoder(nil)
+	e.Opaque(body.Bytes())
+	e.Opaque(mic)
+	return e.Bytes()
+}
+
+func TestUnwrapRefusesEveryTruncation(t *testing.T) {
+	f := &fakeContext{principal: "alice@X"}
+	c := &context{gss: f}
+	full := envelope(f, 7, []byte{0, 0, 0, 1})
+	for n := range len(full) {
+		if _, err := c.unwrapArgs(xdr.NewDecoder(full[:n]), 7); err == nil {
+			t.Errorf("an envelope cut to %d bytes was accepted", n)
+		}
+	}
+	if _, err := c.unwrapArgs(xdr.NewDecoder(full), 7); err != nil {
+		t.Errorf("the whole envelope was refused: %v", err)
+	}
+}
+
+func TestUnwrapRefusesABodyWithoutItsSequenceNumber(t *testing.T) {
+	// A signed, well-formed, EMPTY body. Its checksum is genuine; there is
+	// simply no sequence number inside to compare against the credential's.
+	f := &fakeContext{principal: "alice@X"}
+	c := &context{gss: f}
+	mic, _ := f.MIC(nil)
+	e := xdr.NewEncoder(nil)
+	e.Opaque(nil)
+	e.Opaque(mic)
+	if _, err := c.unwrapArgs(xdr.NewDecoder(e.Bytes()), 7); !errors.Is(err, errShortInteg) {
+		t.Errorf("err = %v, want errShortInteg", err)
+	}
+}
+
+func TestUnwrapRefusesAForgedChecksum(t *testing.T) {
+	f := &fakeContext{principal: "alice@X", verifyErr: errors.New("bad signature")}
+	c := &context{gss: f}
+	if _, err := c.unwrapArgs(xdr.NewDecoder(envelope(f, 7, nil)), 7); err == nil {
+		t.Error("an envelope with a refused checksum was accepted")
+	}
+}
+
+func TestWrapResultsGivesNothingWhenItCannotSign(t *testing.T) {
+	// There is no honest reply to send. Handing back the results unwrapped
+	// would give the client something it refuses anyway; giving back nothing
+	// is what a dropped call looks like, which is the truth here.
+	f := &fakeContext{principal: "alice@X", micErr: errors.New("cannot sign")}
+	c := &context{gss: f}
+	if got := c.wrapResults(1, []byte{0, 0, 0, 0}); got != nil {
+		t.Errorf("wrapResults = %x, want nil", got)
+	}
+}
