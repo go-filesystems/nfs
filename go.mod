@@ -3,7 +3,7 @@ module github.com/go-filesystems/nfs
 go 1.26.4
 
 require (
-	github.com/go-authn/krb5 v0.0.0
+	github.com/go-authn/krb5 v0.1.0
 	github.com/go-filesystems/interface v0.3.0
 	github.com/jcmturner/gokrb5/v8 v8.4.4
 )
@@ -18,5 +18,3 @@ require (
 	golang.org/x/crypto v0.6.0 // indirect
 	golang.org/x/net v0.7.0 // indirect
 )
-
-replace github.com/go-authn/krb5 => ../../go-authn/krb5

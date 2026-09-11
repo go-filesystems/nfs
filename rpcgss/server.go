@@ -30,7 +30,7 @@ const handleLen = 16
 //
 // The zero value is not usable; use [New].
 type Server struct {
-	acceptor *krb5.Acceptor
+	acceptor acceptor
 	window   uint32
 
 	mu       sync.Mutex
@@ -39,7 +39,7 @@ type Server struct {
 
 // context is one established security context.
 type context struct {
-	gss     *krb5.Context
+	gss     secContext
 	window  *seqWindow
 	service uint32
 	expires time.Time
@@ -47,6 +47,10 @@ type context struct {
 
 // New returns a Server accepting tickets for one service.
 func New(a *krb5.Acceptor) *Server {
+	return newServer(krb5Acceptor{a})
+}
+
+func newServer(a acceptor) *Server {
 	return &Server{acceptor: a, window: defaultWindow, contexts: make(map[string]*context)}
 }
 
@@ -104,7 +108,7 @@ func (s *Server) init(c *rpc.AuthCall, cr cred) rpc.AuthDecision {
 	}
 
 	handle := make([]byte, handleLen)
-	if _, err := rand.Read(handle); err != nil {
+	if _, err := randRead(handle); err != nil {
 		return rpc.AuthDecision{Reject: statCtxProblem}
 	}
 	s.mu.Lock()
@@ -208,6 +212,11 @@ func (s *Server) Contexts() int {
 	defer s.mu.Unlock()
 	return len(s.contexts)
 }
+
+// randRead is crypto/rand.Read, replaceable so that a handle that cannot be
+// minted is something a test can produce rather than something only a broken
+// machine would.
+var randRead = rand.Read
 
 // be32 renders a number the way RFC 2203 signs it: as the four bytes of an
 // XDR unsigned int, not as its decimal spelling.

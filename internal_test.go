@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -621,4 +622,37 @@ func TestExportRejectsANilFilesystem(t *testing.T) {
 	if err := s.Export("/", nil); !errors.Is(err, ErrNilFilesystem) {
 		t.Fatalf("Export(nil) = %v, want ErrNilFilesystem", err)
 	}
+}
+
+// stubAuth is an authenticator that is never consulted: the test is about
+// whether the server accepts being GIVEN one, not about what it does with it.
+type stubAuth struct{}
+
+func (stubAuth) Flavor() uint32                              { return 6 }
+func (stubAuth) Authenticate(*rpc.AuthCall) rpc.AuthDecision { return rpc.AuthDecision{} }
+
+// TestSetAuthenticatorOnlyBeforeServing: a server that is already answering
+// clients must not change flavours underneath them. A client that mounted a
+// moment earlier would be on the old configuration with no way to tell, and
+// the symptom would appear on some later call with nothing to connect it to.
+func TestSetAuthenticatorOnlyBeforeServing(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.SetAuthenticator(stubAuth{}); err != nil {
+		t.Fatalf("SetAuthenticator before serving: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Serve(ln)
+	t.Cleanup(func() { s.Close() })
+	// Serve sets started under the same lock SetAuthenticator takes, so the
+	// only way to observe the transition is to wait for it.
+	for range 100 {
+		if err := s.SetAuthenticator(stubAuth{}); errors.Is(err, ErrServing) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Error("SetAuthenticator kept being accepted after Serve started")
 }

@@ -57,8 +57,32 @@ jobs:
           CGO_ENABLED: "0"
         run: go build -mod=mod ./...
 
+      # ⛔ A judge belongs in every lane that RUNS the tests. The RPCSEC_GSS
+      # tests need a Kerberos realm; without one they SKIP, and a skip is not
+      # a failure. Two things stop that here: KRB5_REQUIRE_JUDGE turns a
+      # missing fixture into an error, and the 100% coverage gate below falls
+      # to 97.2% when these tests do not run — the gate is the second control,
+      # and it is the one nobody can forget to set.
+      #
+      # Ubuntu's own MIT packages are enough: unlike go-authn/krb5, nothing
+      # here needs MIT's gss-client, because the RFC 2203 initiator is written
+      # in the tests. DEBIAN_FRONTEND stops krb5-kdc asking for a realm.
+      - name: MIT Kerberos
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user
+      - name: A throwaway realm on loopback
+        working-directory: nfs
+        run: |
+          timeout 300 ./test/kdc.sh "$RUNNER_TEMP/krb5"
+          cat "$RUNNER_TEMP/krb5/env" >> "$GITHUB_ENV"
+
       - name: Test (race + coverage)
         working-directory: nfs
+        env:
+          KRB5_REQUIRE_JUDGE: "1"
         run: go test -mod=mod -race -coverpkg=./... -coverprofile=cover.out -covermode=atomic ./...
 
       - name: Enforce coverage gate
