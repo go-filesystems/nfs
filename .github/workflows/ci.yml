@@ -719,10 +719,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/tls
+          # tlshd verifies the NAME the mount used, canonicalised by its own
+          # resolver: its log says "Handshake with 'localhost' (127.0.0.1)".
+          # A certificate carrying only the IP is refused with "Certificate
+          # owner unexpected", which names neither the field nor the name.
           openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
             -keyout /tmp/tls/key.pem -out /tmp/tls/cert.pem -days 1 \
             -subj "/CN=nfs-tls-judge" \
-            -addext "subjectAltName=IP:127.0.0.1" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
             -addext "extendedKeyUsage=serverAuth" 2>/dev/null
           sudo cp /tmp/tls/cert.pem /usr/local/share/ca-certificates/nfs-tls-judge.crt
           sudo update-ca-certificates >/dev/null
