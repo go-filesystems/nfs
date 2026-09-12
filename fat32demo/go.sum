@@ -1,8 +1,8 @@
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/go-authn/krb5 v0.1.0 h1:BYMIyOvUW1Q6mJxt49yyFG7y4NktRMI+2NAyFbiMcPw=
-github.com/go-authn/krb5 v0.1.0/go.mod h1:OKwOP1tWIqY6GhTEDYXHvtQUKDmGuvxTIN7TOjv7Xjs=
+github.com/go-authn/krb5 v0.2.0 h1:6dQ5K7Gy1a3nsjxl5G15RQQnRKWdMWczBnhkoUr73eU=
+github.com/go-authn/krb5 v0.2.0/go.mod h1:OKwOP1tWIqY6GhTEDYXHvtQUKDmGuvxTIN7TOjv7Xjs=
 github.com/go-filesystems/fat32 v0.3.0 h1:lq2nFNXTI6wLOKtSA2SDQgbHNzgN9mMdElrcwsgwQrE=
 github.com/go-filesystems/fat32 v0.3.0/go.mod h1:twfQw/efVJW0ccGZoaxW3HXJG0RSM8xKsBUG1PIIWAQ=
 github.com/go-filesystems/interface v0.3.0 h1:cV4+2mvW1eCPyde+KIDRaGuIPAcr2sDgKrxGuGQr98k=

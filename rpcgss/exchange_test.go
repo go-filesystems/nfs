@@ -15,6 +15,7 @@ import (
 
 	"github.com/jcmturner/gokrb5/v8/client"
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
+	"github.com/jcmturner/gokrb5/v8/crypto"
 	"github.com/jcmturner/gokrb5/v8/gssapi"
 	"github.com/jcmturner/gokrb5/v8/iana/keyusage"
 	"github.com/jcmturner/gokrb5/v8/spnego"
@@ -379,14 +380,18 @@ func TestAForgedVerifierIsRefused(t *testing.T) {
 	}
 }
 
-func TestPrivacyIsRefusedNotDowngraded(t *testing.T) {
+func TestAnUnknownServiceIsRefusedNotDowngraded(t *testing.T) {
+	// Three services are defined and this server implements all three, so
+	// the refusal to test is of a number that means nothing. Serving it as
+	// svc_none would give a client less protection than it believes it has,
+	// which is the one failure a client cannot detect for itself.
 	keytabPath, service := fixture(t)
-	i := establish(t, server(t, keytabPath), service)
-	i.dataCall(t, 1, 3 /* rpc_gss_svc_privacy */)
-	// Refused, not served as something weaker: a client that asked for
-	// privacy and silently got none would never find out.
-	if got := i.denied(t); got != 13 {
-		t.Errorf("auth_stat = %d, want 13 (RPCSEC_GSS_CREDPROBLEM)", got)
+	for _, svc := range []uint32{0, 4, 99} {
+		i := establish(t, server(t, keytabPath), service)
+		i.dataCall(t, 1, svc)
+		if got := i.denied(t); got != 13 {
+			t.Errorf("service %d: auth_stat = %d, want 13 (RPCSEC_GSS_CREDPROBLEM)", svc, got)
+		}
 	}
 }
 
@@ -686,6 +691,133 @@ func TestAnAlteredArgumentIsRefused(t *testing.T) {
 	env[len(env)-1] ^= 1
 	i.send(t, h, rpc.Auth{Flavor: rpcgss.Flavor, Body: i.mic(t, h)}, func(e *xdr.Encoder) {
 		e.Fixed(env)
+	})
+	if got := i.denied(t); got != 4 {
+		t.Errorf("auth_stat = %d, want 4 (AUTH_REJECTEDVERF)", got)
+	}
+}
+
+// sealAsInitiator produces what a krb5p client sends: GSS_Wrap with
+// confidentiality over the sequence number and the real arguments. gokrb5
+// cannot do this, so the token is built here from the same primitives
+// go-authn/krb5 uses on the other side.
+func (i *initiator) sealAsInitiator(t *testing.T, seq uint32, args func(*xdr.Encoder)) []byte {
+	t.Helper()
+	body := xdr.NewEncoder(nil)
+	body.Uint32(seq)
+	if args != nil {
+		args(body)
+	}
+	hdr := make([]byte, 16)
+	hdr[0], hdr[1] = 0x05, 0x04
+	hdr[2] = 0x02 // Sealed, sent by the initiator
+	hdr[3] = 0xFF
+	plain := append(append([]byte{}, body.Bytes()...), hdr...)
+
+	et, err := crypto.GetEtype(i.key.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cipher, err := et.EncryptMessage(i.key.KeyValue, plain, keyusage.GSSAPI_INITIATOR_SEAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := xdr.NewEncoder(nil)
+	e.Opaque(append(hdr, cipher...))
+	return e.Bytes()
+}
+
+// openAsInitiator opens what a krb5p server sends back.
+func (i *initiator) openAsInitiator(t *testing.T, seq uint32, d *xdr.Decoder) *xdr.Decoder {
+	t.Helper()
+	d.SetLimit(1 << 20)
+	sealed, err := d.Opaque()
+	if err != nil {
+		t.Fatalf("the reply is not a privacy envelope: %v", err)
+	}
+	if len(sealed) < 16 {
+		t.Fatalf("the sealed reply is %d bytes", len(sealed))
+	}
+	if sealed[2]&0x02 == 0 {
+		t.Fatalf("the reply is NOT sealed: flags %#x", sealed[2])
+	}
+	et, err := crypto.GetEtype(i.key.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := et.DecryptMessage(i.key.KeyValue, sealed[16:], keyusage.GSSAPI_ACCEPTOR_SEAL)
+	if err != nil {
+		t.Fatalf("the reply does not decrypt: %v", err)
+	}
+	inner := xdr.NewDecoder(plain[:len(plain)-16])
+	got, err := inner.Uint32()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != seq {
+		t.Errorf("the sealed reply carries seq %d, want %d", got, seq)
+	}
+	inner.SetLimit(0)
+	return inner
+}
+
+func TestPrivacyEncryptsArgumentsAndResults(t *testing.T) {
+	keytabPath, service := fixture(t)
+	i := establish(t, server(t, keytabPath), service)
+
+	const seq = 51
+	cr := i.cred(0, seq, 3 /* rpc_gss_svc_privacy */)
+	h := i.header(1, cr)
+	i.send(t, h, rpc.Auth{Flavor: rpcgss.Flavor, Body: i.mic(t, h)}, func(e *xdr.Encoder) {
+		e.Fixed(i.sealAsInitiator(t, seq, nil))
+	})
+	verf, accept, d := i.reply(t)
+	if accept != 0 {
+		t.Fatalf("accept_stat = %d", accept)
+	}
+	i.verifyServerMIC(t, be32(seq), verf.Body)
+
+	inner := i.openAsInitiator(t, seq, d)
+	who, err := inner.String()
+	if err != nil {
+		t.Fatalf("the decrypted results do not decode: %v", err)
+	}
+	if who == "" {
+		t.Error("the procedure saw no principal")
+	}
+	t.Logf("sec=krb5p: %s, arguments and results both encrypted", who)
+}
+
+func TestASealedBodyCannotBeMovedOntoAnotherCall(t *testing.T) {
+	keytabPath, service := fixture(t)
+	i := establish(t, server(t, keytabPath), service)
+
+	// Encryption does not make a body harder to move: both the header
+	// signature and the sealed body are genuine, and only the two copies of
+	// the sequence number disagree.
+	const credSeq, bodySeq = 61, 60
+	cr := i.cred(0, credSeq, 3)
+	h := i.header(1, cr)
+	i.send(t, h, rpc.Auth{Flavor: rpcgss.Flavor, Body: i.mic(t, h)}, func(e *xdr.Encoder) {
+		e.Fixed(i.sealAsInitiator(t, bodySeq, nil))
+	})
+	if got := i.denied(t); got != 4 {
+		t.Errorf("auth_stat = %d, want 4 (AUTH_REJECTEDVERF)", got)
+	}
+}
+
+func TestAnUnsealedBodyIsRefusedUnderPrivacy(t *testing.T) {
+	// The client asked for privacy and then sent something readable. Serving
+	// it would mean the flavour promised confidentiality and delivered none,
+	// which is the one failure a client cannot detect for itself.
+	keytabPath, service := fixture(t)
+	i := establish(t, server(t, keytabPath), service)
+
+	const seq = 71
+	cr := i.cred(0, seq, 3)
+	h := i.header(1, cr)
+	i.send(t, h, rpc.Auth{Flavor: rpcgss.Flavor, Body: i.mic(t, h)}, func(e *xdr.Encoder) {
+		e.Fixed(i.integWrap(t, seq, nil)) // an INTEGRITY envelope, in the clear
 	})
 	if got := i.denied(t); got != 4 {
 		t.Errorf("auth_stat = %d, want 4 (AUTH_REJECTEDVERF)", got)

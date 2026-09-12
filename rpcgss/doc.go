@@ -20,8 +20,13 @@
 // once inside the signed body, and comparing the two is what catches a signed
 // body moved onto another call's header.
 //
-// It does NOT implement rpc_gss_svc_privacy (sec=krb5p), and it refuses a
-// call asking for it rather than quietly serving it with less protection than
-// the client believes it has. That refusal is the point: a client that asked
-// for privacy and got none would never find out.
+// rpc_gss_svc_privacy, which is sec=krb5p: the arguments and results are
+// encrypted. What it adds over integrity is confidentiality and nothing else
+// — the sequence number is still carried inside and still compared against
+// the credential's copy, because a sealed body is no harder to move onto
+// another call's header than a signed one.
+//
+// A service number that is none of the three is REFUSED rather than served as
+// svc_none. That refusal is the point: a client that asked for privacy and
+// got none would never find out.
 package rpcgss

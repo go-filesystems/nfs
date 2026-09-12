@@ -153,10 +153,12 @@ func (s *Server) data(c *rpc.AuthCall, cr cred) rpc.AuthDecision {
 		s.drop(cr.handle)
 		return rpc.AuthDecision{Reject: statCtxProblem}
 	}
-	if cr.service != svcNone && cr.service != svcIntegrity {
-		// Privacy is refused rather than served as something weaker. A
-		// client that asked for it and silently got none would have no way
-		// to find out.
+	switch cr.service {
+	case svcNone, svcIntegrity, svcPrivacy:
+	default:
+		// A service number this server does not implement. Serving it as
+		// something weaker would give a client less protection than it
+		// believes it has, with no way to find out.
 		return rpc.AuthDecision{Reject: statCredProblem}
 	}
 	if c.Verf.Flavor != Flavor {
@@ -188,17 +190,27 @@ func (s *Server) data(c *rpc.AuthCall, cr cred) rpc.AuthDecision {
 		Verf:      rpc.Auth{Flavor: Flavor, Body: verf},
 		Principal: ctx.gss.Principal(),
 	}
-	if cr.service == svcIntegrity && cr.proc == procData {
-		inner, err := ctx.unwrapArgs(c.Args, cr.seq)
+	if cr.proc == procData && cr.service != svcNone {
+		var inner *xdr.Decoder
+		var err error
+		if cr.service == svcIntegrity {
+			inner, err = ctx.unwrapArgs(c.Args, cr.seq)
+		} else {
+			inner, err = ctx.unwrapArgsPriv(c.Args, cr.seq)
+		}
 		if err != nil {
-			// The envelope is signed by the same key as the verifier that
+			// The envelope is protected by the same key as the verifier that
 			// already checked out, so a failure here is not a bad context:
 			// it is a body that does not belong to this call.
 			return rpc.AuthDecision{Reject: 4} // AUTH_REJECTEDVERF
 		}
 		dec.Args = inner
+		service := cr.service
 		dec.WrapResults = func(results []byte) []byte {
-			return ctx.wrapResults(cr.seq, results)
+			if service == svcIntegrity {
+				return ctx.wrapResults(cr.seq, results)
+			}
+			return ctx.wrapResultsPriv(cr.seq, results)
 		}
 	}
 	if cr.proc == procDestroy {
