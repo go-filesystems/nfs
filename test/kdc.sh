@@ -23,6 +23,10 @@ set -eu
 DIR=${1:-${TMPDIR:-/tmp}/krb5-judge}
 REALM=${KRB5_TEST_REALM:-FLEET.TEST}
 PORT=${KRB5_TEST_PORT:-8888}
+# Which address the KDC answers on. Loopback by default, because a test realm
+# that listens on the network is a service nobody asked for; set it when the
+# client is somewhere else, such as a VM.
+LISTEN=${KRB5_TEST_LISTEN:-127.0.0.1}
 USER_PW=${KRB5_TEST_PASSWORD:-alicepw}
 SERVICE=${KRB5_TEST_SERVICE:-nfs}
 
@@ -84,7 +88,7 @@ mkdir -p "$DIR/db"
     echo "    rdns = false"
     echo "[realms]"
     echo "    $REALM = {"
-    echo "        kdc = 127.0.0.1:$PORT"
+    echo "        kdc = $LISTEN:$PORT"
     echo "        database_name = $DIR/db/principal"
     echo "        key_stash_file = $DIR/db/stash"
     echo "        acl_file = $DIR/kadm5.acl"
@@ -107,7 +111,7 @@ mkdir -p "$DIR/db"
     echo "[kdcdefaults]"
     echo "    kdc_ports = $PORT"
     echo "    kdc_tcp_ports = $PORT"
-    echo "    kdc_listen = 127.0.0.1:$PORT"
+    echo "    kdc_listen = $LISTEN:$PORT"
     # krb5kdc logs to syslog by default, and then exits 1 without a word when
     # anything goes wrong. A FILE destination is how you find out why.
     echo "[logging]"
