@@ -3,7 +3,7 @@ module github.com/go-filesystems/nfs/fat32demo
 go 1.26.4
 
 require (
-	github.com/go-authn/krb5 v0.1.0
+	github.com/go-authn/krb5 v0.2.0
 	github.com/go-filesystems/fat32 v0.3.0
 	github.com/go-filesystems/interface v0.3.0
 	github.com/go-filesystems/nfs v0.2.0

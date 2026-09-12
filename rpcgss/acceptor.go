@@ -24,6 +24,8 @@ type secContext interface {
 	Expires() time.Time
 	MIC(msg []byte) ([]byte, error)
 	VerifyMIC(msg, token []byte) error
+	Seal(msg []byte) ([]byte, error)
+	Unseal(token []byte) ([]byte, error)
 }
 
 // krb5Acceptor adapts *krb5.Acceptor, whose Accept returns a concrete

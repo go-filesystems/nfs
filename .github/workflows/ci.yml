@@ -565,11 +565,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # sec=krb5 signs the call header; sec=krb5i signs the arguments and
-        # results as well. They are separate lanes because they are separate
-        # code paths on BOTH sides, and a single lane passing would say
-        # nothing about the other.
-        sec: [krb5, krb5i]
+        # krb5 signs the call header; krb5i signs the arguments and results
+        # too; krb5p encrypts them. Three lanes because they are three code
+        # paths on BOTH sides, and one passing would say nothing about the
+        # others.
+        sec: [krb5, krb5i, krb5p]
     steps:
       - uses: actions/checkout@v7
         with:

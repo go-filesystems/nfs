@@ -1,6 +1,7 @@
 package rpcgss
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ type fakeContext struct {
 	expires   time.Time
 	micErr    error
 	verifyErr error
+	sealErr   error
+	unsealErr error
 }
 
 func (f *fakeContext) Principal() string           { return f.principal }
@@ -217,5 +220,73 @@ func TestWrapResultsGivesNothingWhenItCannotSign(t *testing.T) {
 	c := &context{gss: f}
 	if got := c.wrapResults(1, []byte{0, 0, 0, 0}); got != nil {
 		t.Errorf("wrapResults = %x, want nil", got)
+	}
+}
+
+// Seal and Unseal on the fake are deliberately NOT encryption: what these
+// tests exercise is the envelope around them, and a real cipher here would
+// only test gokrb5 a second time. The prefix is what makes an unsealed body
+// distinguishable from a sealed one in a test that gets the two confused.
+func (f *fakeContext) Seal(msg []byte) ([]byte, error) {
+	if f.sealErr != nil {
+		return nil, f.sealErr
+	}
+	return append([]byte("sealed:"), msg...), nil
+}
+
+func (f *fakeContext) Unseal(token []byte) ([]byte, error) {
+	if f.unsealErr != nil {
+		return nil, f.unsealErr
+	}
+	if !bytes.HasPrefix(token, []byte("sealed:")) {
+		return nil, errors.New("not sealed")
+	}
+	return token[len("sealed:"):], nil
+}
+
+// privEnvelope builds an rpc_gss_priv_data around a body, using the fake's
+// stand-in for sealing.
+func privEnvelope(f *fakeContext, seq uint32, extra []byte) []byte {
+	body := xdr.NewEncoder(nil)
+	body.Uint32(seq)
+	body.Fixed(extra)
+	sealed, _ := f.Seal(body.Bytes())
+	e := xdr.NewEncoder(nil)
+	e.Opaque(sealed)
+	return e.Bytes()
+}
+
+func TestUnwrapPrivRefusesEveryTruncation(t *testing.T) {
+	f := &fakeContext{principal: "alice@X"}
+	c := &context{gss: f}
+	full := privEnvelope(f, 7, []byte{0, 0, 0, 1})
+	for n := range len(full) {
+		if _, err := c.unwrapArgsPriv(xdr.NewDecoder(full[:n]), 7); err == nil {
+			t.Errorf("an envelope cut to %d bytes was accepted", n)
+		}
+	}
+	if _, err := c.unwrapArgsPriv(xdr.NewDecoder(full), 7); err != nil {
+		t.Errorf("the whole envelope was refused: %v", err)
+	}
+}
+
+func TestUnwrapPrivRefusesABodyWithoutItsSequenceNumber(t *testing.T) {
+	f := &fakeContext{principal: "alice@X"}
+	c := &context{gss: f}
+	sealed, _ := f.Seal(nil)
+	e := xdr.NewEncoder(nil)
+	e.Opaque(sealed)
+	if _, err := c.unwrapArgsPriv(xdr.NewDecoder(e.Bytes()), 7); !errors.Is(err, errShortInteg) {
+		t.Errorf("err = %v, want errShortInteg", err)
+	}
+}
+
+func TestWrapResultsPrivGivesNothingWhenItCannotSeal(t *testing.T) {
+	// Results that could not be sealed must not go out in the clear under a
+	// flavour whose whole promise is that they will not.
+	f := &fakeContext{principal: "alice@X", sealErr: errors.New("cannot seal")}
+	c := &context{gss: f}
+	if got := c.wrapResultsPriv(1, []byte{0, 0, 0, 0}); got != nil {
+		t.Errorf("wrapResultsPriv = %x, want nil", got)
 	}
 }
