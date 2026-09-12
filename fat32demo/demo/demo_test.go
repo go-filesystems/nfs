@@ -2,8 +2,15 @@ package demo_test
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -485,6 +492,98 @@ func TestKeytabOption(t *testing.T) {
 		var out, errOut bytes.Buffer
 		if rc := demo.Main([]string{"-image", path, "-keytab", "/nonexistent.keytab"}, &out, &errOut); rc != 1 {
 			t.Fatalf("Main with an unreadable keytab = %d, want 1", rc)
+		}
+	})
+}
+
+// writeCert makes a self-signed certificate on disk for 127.0.0.1.
+func writeCert(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "fat32demo"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+	cf, err := os.Create(certPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		t.Fatal(err)
+	}
+	cf.Close()
+	kb, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kf, err := os.Create(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}); err != nil {
+		t.Fatal(err)
+	}
+	kf.Close()
+	return certPath, keyPath
+}
+
+// TestTLSOption: -tls-cert turns on RFC 9289 and says so, and a certificate
+// that cannot be read STOPS the server. The second half is the one that
+// matters: a server that shrugged would serve in the clear and look exactly
+// like one that was protecting the connection.
+func TestTLSOption(t *testing.T) {
+	path, _ := makeImage(t)
+	certPath, keyPath := writeCert(t)
+
+	t.Run("a certificate that cannot be read stops the server", func(t *testing.T) {
+		var out bytes.Buffer
+		_, _, err := demo.SetupOpts(path, "127.0.0.1:0", false, false, &out,
+			demo.TLS(filepath.Join(t.TempDir(), "absent.pem"), keyPath))
+		if err == nil {
+			t.Fatal("a missing certificate was accepted")
+		}
+	})
+
+	t.Run("a readable one is announced", func(t *testing.T) {
+		var out bytes.Buffer
+		srv, ln, err := demo.SetupOpts(path, "127.0.0.1:0", false, false, &out,
+			demo.TLS(certPath, keyPath))
+		if err != nil {
+			t.Fatalf("SetupOpts: %v", err)
+		}
+		defer srv.Close()
+		defer ln.Close()
+		if !strings.Contains(out.String(), "xprtsec=tls accepted") {
+			t.Errorf("the server did not announce TLS:\n%s", out.String())
+		}
+		// ⛔ And that plain TCP is STILL accepted. TLS here is an addition,
+		// not a restriction.
+		if !strings.Contains(out.String(), "plain TCP still accepted") {
+			t.Errorf("the server did not say plain TCP is still accepted:\n%s", out.String())
+		}
+	})
+
+	t.Run("Main passes the flags through", func(t *testing.T) {
+		var out, errOut bytes.Buffer
+		if rc := demo.Main([]string{"-image", path, "-tls-cert", "/nonexistent.pem", "-tls-key", keyPath}, &out, &errOut); rc != 1 {
+			t.Fatalf("Main with an unreadable certificate = %d, want 1", rc)
 		}
 	})
 }

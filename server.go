@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"crypto/tls"
 	"errors"
 	"io/fs"
 	"net"
@@ -363,4 +364,24 @@ func (s *Server) authFlavor() (uint32, bool) {
 		return 0, false
 	}
 	return s.rpcsrv.Auth.Flavor(), true
+}
+
+// SetTLS makes this server answer the AUTH_TLS probe of RFC 9289 and upgrade
+// the connection, which is what a Linux client mounting with xprtsec=tls
+// expects.
+//
+// It does NOT make TLS required, and it authenticates the MACHINE rather than
+// the person: a certificate says which host is talking, not who. That is a
+// different guarantee from sec=krb5, not a substitute for it, and the two
+// compose — a Kerberos mount over TLS gets both.
+//
+// Call it before Serve.
+func (s *Server) SetTLS(cfg *tls.Config) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return ErrServing
+	}
+	s.rpcsrv.TLS = cfg
+	return nil
 }

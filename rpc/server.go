@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -53,6 +54,10 @@ type Call struct {
 	Res *xdr.Encoder
 	// Remote is the client's address, for export access checks.
 	Remote net.Addr
+	// TLS is the connection's TLS state, or nil when the call arrived in
+	// the clear. A procedure that must not serve an unprotected caller has
+	// to look: nothing else distinguishes the two.
+	TLS *tls.ConnectionState
 }
 
 // Proc is a procedure implementation.
@@ -100,6 +105,18 @@ var errRecordTooLarge = errors.New("rpc: record too large")
 type Server struct {
 	// MaxRecord caps one RPC record in bytes. Zero means maxRecordDefault.
 	MaxRecord int
+
+	// TLS, when set, makes this server answer the AUTH_TLS probe (RFC 9289)
+	// and upgrade the connection. Nil means the probe is answered the way
+	// any unknown flavour is, which is what tells a client not to try.
+	//
+	// It does NOT make TLS required. A client that never probes is served
+	// in the clear, and [Call.TLS] is how a procedure can tell the
+	// difference — a server that treated the two alike would be offering a
+	// guarantee it does not keep.
+	//
+	// Set it before Serve.
+	TLS *tls.Config
 
 	// Auth evaluates one further credential flavour — RPCSEC_GSS is the
 	// reason it exists. Nil means AUTH_NULL and AUTH_UNIX and nothing else,
@@ -222,15 +239,21 @@ func (s *Server) Close() error {
 
 // serveConn reads records off one connection until it fails or the server
 // closes.
-func (s *Server) serveConn(c net.Conn) {
+func (s *Server) serveConn(raw net.Conn) {
+	// raw is what Close and the connection table know about, and it stays
+	// that. c is what this loop reads and writes, and a STARTTLS upgrade
+	// REPLACES it — closing or deleting the wrapper instead would leave the
+	// entry in the table for a connection nobody can close.
+	c := raw
 	defer func() {
-		c.Close()
+		raw.Close()
 		s.mu.Lock()
-		delete(s.conns, c)
+		delete(s.conns, raw)
 		s.mu.Unlock()
 	}()
 
 	var req, out []byte
+	var state *tls.ConnectionState
 	res := make([]byte, 0, 8192)
 	for {
 		var err error
@@ -238,7 +261,8 @@ func (s *Server) serveConn(c net.Conn) {
 		if err != nil {
 			return
 		}
-		res, err = s.handle(req, res[:0], c.RemoteAddr())
+		var startTLS bool
+		res, startTLS, err = s.handle(req, res[:0], c.RemoteAddr(), state)
 		if err != nil {
 			// Nothing sensible can be replied to a message that is not
 			// even a call, so the connection goes.
@@ -246,6 +270,17 @@ func (s *Server) serveConn(c net.Conn) {
 		}
 		if out, err = writeRecord(c, res, out); err != nil {
 			return
+		}
+		if startTLS {
+			// The reply saying STARTTLS has gone out; RFC 9289 §5.1 has the
+			// client send its ClientHello on THIS connection next. Replacing
+			// c means every later read and write goes through TLS, including
+			// the record framing.
+			upgraded, st, err := upgrade(c, s.TLS)
+			if err != nil {
+				return
+			}
+			c, state = upgraded, st
 		}
 	}
 }
@@ -292,7 +327,7 @@ func writeRecord(w io.Writer, body, scratch []byte) ([]byte, error) {
 
 // handle turns one request record into one reply record. A non-nil error
 // means no reply is possible and the connection should be dropped.
-func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
+func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionState) ([]byte, bool, error) {
 	d := xdr.NewDecoder(req)
 	e := xdr.NewEncoder(res)
 	h, err := decodeCall(d, len(req))
@@ -301,9 +336,23 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 			// The xid was decoded before the version check failed, so the
 			// client can be told which versions it should have used.
 			encodeDenied(e, h.xid, rjRPCMismatch, rpcVersion, rpcVersion)
-			return e.Bytes(), nil
+			return e.Bytes(), false, nil
 		}
-		return nil, err
+		return nil, false, err
+	}
+
+	// RFC 9289 §5.1: the probe is a NULL call that asks one question. It is
+	// answered before the flavour switch below, because AUTH_TLS is not a
+	// credential and has no business being evaluated as one.
+	if isTLSProbe(h) {
+		if s.TLS == nil {
+			// Not refusing it loudly: a client reads the verifier, and one
+			// that is not STARTTLS is exactly how RFC 9289 says "no".
+			encodeDenied(e, h.xid, rjAuthError, 5, 0)
+			return e.Bytes(), false, nil
+		}
+		encodeAccepted(e, h.xid, stSuccess, Auth{Flavor: AuthNull, Body: starttls})
+		return e.Bytes(), true, nil
 	}
 
 	// Which flavours this server evaluates, and what it does with the rest.
@@ -321,7 +370,7 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 		})
 		if dec.Reject != 0 {
 			encodeDenied(e, h.xid, rjAuthError, dec.Reject, 0)
-			return e.Bytes(), nil
+			return e.Bytes(), false, nil
 		}
 		verf, principal, wrap = dec.Verf, dec.Principal, dec.WrapResults
 		if dec.Args != nil {
@@ -337,14 +386,14 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 			// would hand NULLPROC a token it has no idea about.
 			encodeAccepted(e, h.xid, stSuccess, verf)
 			dec.Reply(e)
-			return e.Bytes(), nil
+			return e.Bytes(), false, nil
 		}
 	default:
 		// AUTH_TOOWEAK (auth_stat 5): the client offered a flavour this
 		// server cannot evaluate. Saying so lets it retry with AUTH_UNIX
 		// instead of retransmitting forever.
 		encodeDenied(e, h.xid, rjAuthError, 5, 0)
-		return e.Bytes(), nil
+		return e.Bytes(), false, nil
 	}
 
 	prog, progExists, lo, hi := s.lookup(h.prog, h.vers)
@@ -354,16 +403,16 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 		encodeAccepted(e, h.xid, stProgMismatch, authNone)
 		e.Uint32(lo)
 		e.Uint32(hi)
-		return e.Bytes(), nil
+		return e.Bytes(), false, nil
 	default:
 		encodeAccepted(e, h.xid, stProgUnavail, authNone)
-		return e.Bytes(), nil
+		return e.Bytes(), false, nil
 	}
 
 	proc, ok := prog.Procs[h.proc]
 	if !ok {
 		encodeAccepted(e, h.xid, stProcUnavail, authNone)
-		return e.Bytes(), nil
+		return e.Bytes(), false, nil
 	}
 
 	encodeAccepted(e, h.xid, stSuccess, verf)
@@ -371,6 +420,7 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 	st := proc(&Call{
 		XID: h.xid, Prog: h.prog, Vers: h.vers, Proc: h.proc,
 		Cred: h.cred, Principal: principal, Args: d, Res: e, Remote: remote,
+		TLS: state,
 	})
 	if st != StatusSuccess {
 		// Rewind past whatever the procedure had already written. The header
@@ -378,7 +428,7 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 		// from zero is exact rather than a patch-up.
 		e.Truncate(0)
 		encodeAccepted(e, h.xid, uint32(st), verf)
-		return e.Bytes(), nil
+		return e.Bytes(), false, nil
 	}
 	if wrap != nil {
 		// Only a successful reply carries results to wrap. Wrapping an
@@ -388,5 +438,5 @@ func (s *Server) handle(req, res []byte, remote net.Addr) ([]byte, error) {
 		e.Truncate(results)
 		e.Fixed(out)
 	}
-	return e.Bytes(), nil
+	return e.Bytes(), false, nil
 }
