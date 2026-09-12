@@ -685,3 +685,117 @@ jobs:
 
           sudo umount /mnt/krb5
           echo "unmounted cleanly"
+
+  # ----------------------------------------------------------------------
+  # RFC 9289, judged the same way Kerberos is: by a client that read the RFC
+  # independently. The kernel does the RPC side and hands the handshake to
+  # tlshd, a userspace daemon — so this lane exercises a second program's
+  # reading as well as the kernel's.
+  # ----------------------------------------------------------------------
+  live-mount-tls:
+    name: live mount with TLS (linux kernel client)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: nfs
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/fat32demo/go.mod
+      - name: Install the NFS client and tlshd
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nfs-common ktls-utils
+          # The kernel does the RPC; tlshd does the handshake. Without it the
+          # mount hangs rather than failing, which is the worst shape.
+          tlshd -v 2>/dev/null || dpkg -l ktls-utils | tail -1
+      - name: A certificate the client will trust
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tls
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+            -keyout /tmp/tls/key.pem -out /tmp/tls/cert.pem -days 1 \
+            -subj "/CN=nfs-tls-judge" \
+            -addext "subjectAltName=IP:127.0.0.1" \
+            -addext "extendedKeyUsage=serverAuth" 2>/dev/null
+          sudo cp /tmp/tls/cert.pem /usr/local/share/ca-certificates/nfs-tls-judge.crt
+          sudo update-ca-certificates >/dev/null
+          # tlshd reads its own configuration, not the system trust store
+          # alone: x509.truststore has to name the file.
+          sudo tee /etc/tlshd.conf >/dev/null <<EOF
+          [debug]
+          loglevel=3
+          tls=3
+          [authenticate]
+          keyrings=.nfs
+          [authenticate.client]
+          x509.truststore=/tmp/tls/cert.pem
+          EOF
+          sudo systemctl restart tlshd || sudo systemctl start tlshd
+          systemctl is-active tlshd
+      - name: Serve it with TLS and mount it
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/live ./mkimg
+          cat > ./mkimg/main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+
+              fat32 "github.com/go-filesystems/fat32"
+          )
+
+          func main() {
+              fs, err := fat32.Format("/tmp/live/disk.img", 16<<20, fat32.FormatConfig{Label: "TLS"})
+              if err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.WriteFile("/HELLO.TXT", []byte("carried over tls\n"), 0o644); err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.Close(); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go run -mod=mod ./mkimg
+          rm -rf ./mkimg
+
+          go build -mod=mod -o /tmp/live/fat32demo .
+          /tmp/live/fat32demo -image /tmp/live/disk.img -addr 127.0.0.1:12049 \
+            -tls-cert /tmp/tls/cert.pem -tls-key /tmp/tls/key.pem > /tmp/live/server.log 2>&1 &
+          demo_pid=$!
+          diagnose() {
+            echo "::group::tlshd"; sudo journalctl -u tlshd --no-pager -n 60 2>/dev/null || true; echo "::endgroup::"
+            echo "::group::the server"; cat /tmp/live/server.log 2>/dev/null; echo "::endgroup::"
+            echo "::group::kernel"; sudo dmesg | tail -30 2>/dev/null || true; echo "::endgroup::"
+          }
+          trap 'sudo umount -f /mnt/tls 2>/dev/null || true; kill $demo_pid 2>/dev/null || true; diagnose' EXIT
+          for i in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/12049) 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+
+          sudo mkdir -p /mnt/tls
+          sudo mount -t nfs -o vers=3,tcp,xprtsec=tls,port=12049,mountport=12049,nolock,hard,timeo=600 \
+            127.0.0.1:/ /mnt/tls
+          mount | grep /mnt/tls
+
+          # ⛔ "It mounted" is not the claim: a mount that fell back to plain
+          # TCP looks identical from the outside.
+          grep -q 'xprtsec=tls' /proc/mounts || {
+            echo "::error::the mount is not using xprtsec=tls"; grep /mnt/tls /proc/mounts; exit 1; }
+
+          test "$(cat /mnt/tls/HELLO.TXT)" = "carried over tls"
+          echo "the kernel client read a file over RPC-with-TLS"
+
+          sudo umount /mnt/tls
+          echo "unmounted cleanly"

@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"crypto/tls"
 	"errors"
 	"io"
 	"io/fs"
@@ -711,4 +712,26 @@ func TestMntAnnouncesTheAuthenticatorsFlavour(t *testing.T) {
 			t.Errorf("flavours = %v, want [RPCSEC_GSS AUTH_UNIX AUTH_NULL]", got)
 		}
 	})
+}
+
+// TestSetTLSOnlyBeforeServing: like SetAuthenticator, a server already
+// answering clients must not change underneath them.
+func TestSetTLSOnlyBeforeServing(t *testing.T) {
+	s, _ := newTestServer(t)
+	if err := s.SetTLS(&tls.Config{}); err != nil {
+		t.Fatalf("SetTLS before serving: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Serve(ln)
+	t.Cleanup(func() { s.Close() })
+	for range 100 {
+		if err := s.SetTLS(&tls.Config{}); errors.Is(err, ErrServing) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Error("SetTLS kept being accepted after Serve started")
 }

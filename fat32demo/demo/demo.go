@@ -19,6 +19,8 @@ import (
 	"net"
 	"os"
 
+	"crypto/tls"
+
 	"github.com/go-authn/krb5"
 	fat32 "github.com/go-filesystems/fat32"
 	filesystem "github.com/go-filesystems/interface"
@@ -125,12 +127,17 @@ func Main(args []string, out, errOut io.Writer) int {
 		"hide the driver's Opener/WritableFile capabilities, forcing whole-file reads and writes (for A/B measurement)")
 	keytab := fs.String("keytab", "",
 		"accept sec=krb5 mounts using the service principals in this keytab (sec=sys stays accepted too)")
+	certFile := fs.String("tls-cert", "", "accept xprtsec=tls mounts with this certificate (plain TCP stays accepted too)")
+	keyFile := fs.String("tls-key", "", "the private key for -tls-cert")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	var opts []Option
 	if *keytab != "" {
 		opts = append(opts, Keytab(*keytab))
+	}
+	if *certFile != "" {
+		opts = append(opts, TLS(*certFile, *keyFile))
 	}
 	srv, ln, err := SetupOpts(*image, *addr, *rw, *noPositional, out, opts...)
 	if err != nil {
@@ -148,7 +155,7 @@ func Main(args []string, out, errOut io.Writer) int {
 // there was anything to configure keep compiling.
 type Option func(*settings)
 
-type settings struct{ keytab string }
+type settings struct{ keytab, certFile, keyFile string }
 
 // Keytab makes the server accept sec=krb5 mounts, using the service
 // principals in the keytab at path.
@@ -164,6 +171,9 @@ func applyAuth(srv *nfs.Server, opts []Option, out io.Writer) error {
 	for _, o := range opts {
 		o(&s)
 	}
+	if err := applyTLS(srv, s, out); err != nil {
+		return err
+	}
 	if s.keytab == "" {
 		return nil
 	}
@@ -177,6 +187,33 @@ func applyAuth(srv *nfs.Server, opts []Option, out io.Writer) error {
 	err = srv.SetAuthenticator(rpcgss.New(a))
 	if err == nil {
 		fmt.Fprintf(out, "sec=krb5 accepted (keytab %s); sec=sys still accepted\n", s.keytab)
+	}
+	return err
+}
+
+// TLS makes the server answer the AUTH_TLS probe of RFC 9289, which is what a
+// Linux client mounting with xprtsec=tls expects.
+//
+// Like [Keytab] it adds a possibility rather than a requirement: a client that
+// never probes is still served in the clear. And a certificate says which HOST
+// is talking, not who — it is not a substitute for sec=krb5, it composes with
+// it.
+func TLS(certFile, keyFile string) Option {
+	return func(s *settings) { s.certFile, s.keyFile = certFile, keyFile }
+}
+
+// applyTLS is called from SetupOpts once the server exists.
+func applyTLS(srv *nfs.Server, s settings, out io.Writer) error {
+	if s.certFile == "" {
+		return nil
+	}
+	cert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
+	if err != nil {
+		return err
+	}
+	err = srv.SetTLS(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+	if err == nil {
+		fmt.Fprintf(out, "xprtsec=tls accepted (certificate %s); plain TCP still accepted\n", s.certFile)
 	}
 	return err
 }
