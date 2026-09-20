@@ -80,6 +80,11 @@ func (s *Server) attrFromStat(e *export, path string, st filesystem.Stat) (fattr
 		mtime: s.start,
 		ctime: s.start,
 	}
+	// The MODE describes the export, not the caller: a person who may read
+	// but not write still sees the image's own permissions here, and learns
+	// what THEY may do from ACCESS (RFC 1813 §3.3.4), which is the procedure
+	// a client is supposed to ask. Answering per-caller here would make two
+	// clients disagree about the same file's mode.
 	if e.ro {
 		// Clearing the write bits on a read-only export makes a client's own
 		// permission check agree with the NFS3ERR_ROFS it would otherwise
