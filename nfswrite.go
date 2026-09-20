@@ -171,7 +171,7 @@ func wccFail(res *xdr.Encoder, st Status, after fattr, afterSt Status) {
 
 // SETATTR (RFC 1813 §3.2).
 func (s *Server) procSetAttr(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -203,7 +203,7 @@ func (s *Server) procSetAttr(c *rpc.Call) rpc.Status {
 		wccFail(c.Res, beforeSt, fattr{}, beforeSt)
 		return rpc.StatusSuccess
 	}
-	if e.ro {
+	if !s.mayWrite(c, e) {
 		wccFail(c.Res, StatusROFS, before, StatusOK)
 		return rpc.StatusSuccess
 	}
@@ -245,7 +245,7 @@ func (s *Server) procSetAttr(c *rpc.Call) rpc.Status {
 // driver can do, and because a correct slow answer beats NFS3ERR_NOTSUPP; it
 // is not kept because it is acceptable.
 func (s *Server) procWrite(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -286,7 +286,7 @@ func (s *Server) procWrite(c *rpc.Call) rpc.Status {
 		wccFail(c.Res, beforeSt, fattr{}, beforeSt)
 		return rpc.StatusSuccess
 	}
-	if e.ro {
+	if !s.mayWrite(c, e) {
 		wccFail(c.Res, StatusROFS, before, StatusOK)
 		return rpc.StatusSuccess
 	}
@@ -394,12 +394,12 @@ func (s *Server) createReply(c *rpc.Call, e *export, dir, full string, before fa
 // mutablePrologue performs the checks every creating procedure shares.
 //
 // The caller must hold [Server.fsmu].
-func (s *Server) mutablePrologue(e *export, dir string) (before fattr, st Status) {
+func (s *Server) mutablePrologue(c *rpc.Call, e *export, dir string) (before fattr, st Status) {
 	before, st = s.attrFor(e, dir)
 	if st != StatusOK {
 		return fattr{}, st
 	}
-	if e.ro {
+	if !s.mayWrite(c, e) {
 		return before, StatusROFS
 	}
 	if before.ftype != ftypeDir {
@@ -410,7 +410,7 @@ func (s *Server) mutablePrologue(e *export, dir string) (before fattr, st Status
 
 // CREATE (RFC 1813 §3.8).
 func (s *Server) procCreate(c *rpc.Call) rpc.Status {
-	e, dir, full, st, garbage := s.dirOpArg(c.Args)
+	e, dir, full, st, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -443,7 +443,7 @@ func (s *Server) procCreate(c *rpc.Call) rpc.Status {
 	}
 	s.fsmu.Lock()
 	defer s.fsmu.Unlock()
-	before, st := s.mutablePrologue(e, dir)
+	before, st := s.mutablePrologue(c, e, dir)
 	if st != StatusOK {
 		wccFail(c.Res, st, before, StatusOK)
 		return rpc.StatusSuccess
@@ -464,7 +464,7 @@ func (s *Server) procCreate(c *rpc.Call) rpc.Status {
 
 // MKDIR (RFC 1813 §3.9).
 func (s *Server) procMkdir(c *rpc.Call) rpc.Status {
-	e, dir, full, st, garbage := s.dirOpArg(c.Args)
+	e, dir, full, st, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -478,7 +478,7 @@ func (s *Server) procMkdir(c *rpc.Call) rpc.Status {
 	}
 	s.fsmu.Lock()
 	defer s.fsmu.Unlock()
-	before, st := s.mutablePrologue(e, dir)
+	before, st := s.mutablePrologue(c, e, dir)
 	if st != StatusOK {
 		wccFail(c.Res, st, before, StatusOK)
 		return rpc.StatusSuccess
@@ -497,7 +497,7 @@ func (s *Server) procMkdir(c *rpc.Call) rpc.Status {
 
 // SYMLINK (RFC 1813 §3.10).
 func (s *Server) procSymlink(c *rpc.Call) rpc.Status {
-	e, dir, full, st, garbage := s.dirOpArg(c.Args)
+	e, dir, full, st, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -514,7 +514,7 @@ func (s *Server) procSymlink(c *rpc.Call) rpc.Status {
 	}
 	s.fsmu.Lock()
 	defer s.fsmu.Unlock()
-	before, st := s.mutablePrologue(e, dir)
+	before, st := s.mutablePrologue(c, e, dir)
 	if st != StatusOK {
 		wccFail(c.Res, st, before, StatusOK)
 		return rpc.StatusSuccess
@@ -539,7 +539,7 @@ func (s *Server) procSymlink(c *rpc.Call) rpc.Status {
 // regular file — which is what a client would otherwise have to discover by
 // reading back something that is not a device.
 func (s *Server) procMknod(c *rpc.Call) rpc.Status {
-	e, dir, _, st, garbage := s.dirOpArg(c.Args)
+	e, dir, _, st, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -557,7 +557,7 @@ func (s *Server) procMknod(c *rpc.Call) rpc.Status {
 // removeCommon backs REMOVE and RMDIR, which differ only in which driver call
 // they make and which type they insist on.
 func (s *Server) removeCommon(c *rpc.Call, wantDir bool) rpc.Status {
-	e, dir, full, st, garbage := s.dirOpArg(c.Args)
+	e, dir, full, st, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -567,7 +567,7 @@ func (s *Server) removeCommon(c *rpc.Call, wantDir bool) rpc.Status {
 	}
 	s.fsmu.Lock()
 	defer s.fsmu.Unlock()
-	before, st := s.mutablePrologue(e, dir)
+	before, st := s.mutablePrologue(c, e, dir)
 	if st != StatusOK {
 		wccFail(c.Res, st, before, StatusOK)
 		return rpc.StatusSuccess
@@ -623,11 +623,11 @@ func (s *Server) procRmdir(c *rpc.Call) rpc.Status { return s.removeCommon(c, tr
 
 // RENAME (RFC 1813 §3.14).
 func (s *Server) procRename(c *rpc.Call) rpc.Status {
-	fromE, fromDir, fromFull, st, garbage := s.dirOpArg(c.Args)
+	fromE, fromDir, fromFull, st, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
-	toE, toDir, toFull, st2, garbage := s.dirOpArg(c.Args)
+	toE, toDir, toFull, st2, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -654,7 +654,7 @@ func (s *Server) procRename(c *rpc.Call) rpc.Status {
 	}
 	s.fsmu.Lock()
 	defer s.fsmu.Unlock()
-	fromBefore, st := s.mutablePrologue(fromE, fromDir)
+	fromBefore, st := s.mutablePrologue(c, fromE, fromDir)
 	if st != StatusOK {
 		return renameFail(st, fromBefore, fattr{}, StatusOK, StatusNoEnt)
 	}
@@ -672,11 +672,11 @@ func (s *Server) procRename(c *rpc.Call) rpc.Status {
 
 // LINK (RFC 1813 §3.15).
 func (s *Server) procLink(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
-	linkE, linkDir, linkFull, st2, garbage := s.dirOpArg(c.Args)
+	linkE, linkDir, linkFull, st2, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -693,7 +693,7 @@ func (s *Server) procLink(c *rpc.Call) rpc.Status {
 	s.fsmu.Lock()
 	defer s.fsmu.Unlock()
 	obj, objSt := s.attrFor(e, path)
-	before, st := s.mutablePrologue(linkE, linkDir)
+	before, st := s.mutablePrologue(c, linkE, linkDir)
 	linkFailure := func(st Status) rpc.Status {
 		c.Res.Uint32(uint32(st))
 		encodePostOp(c.Res, obj, objSt)
@@ -728,7 +728,7 @@ func (s *Server) procLink(c *rpc.Call) rpc.Status {
 // implemented rather than left PROC_UNAVAIL: a client that cannot commit will
 // keep retrying and never consider a file durable.
 func (s *Server) procCommit(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}

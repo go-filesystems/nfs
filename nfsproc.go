@@ -8,7 +8,6 @@ import (
 
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/nfs/rpc"
-	"github.com/go-filesystems/nfs/xdr"
 )
 
 // Transfer sizes advertised by FSINFO and enforced by READ/WRITE.
@@ -60,8 +59,8 @@ func (s *Server) nfsProgram() *rpc.Program {
 // garbage reports an argument that did not decode, which is an RPC-level
 // failure; st reports a handle that decoded but does not name anything,
 // which is an ordinary NFS error inside a successful RPC.
-func (s *Server) fhArg(d *xdr.Decoder) (e *export, path string, st Status, garbage bool) {
-	h, err := d.Opaque()
+func (s *Server) fhArg(c *rpc.Call) (e *export, path string, st Status, garbage bool) {
+	h, err := c.Args.Opaque()
 	if err != nil {
 		return nil, "", StatusOK, true
 	}
@@ -79,12 +78,19 @@ func (s *Server) fhArg(d *xdr.Decoder) (e *export, path string, st Status, garba
 		// what a client can act on.
 		return nil, "", StatusStale, false
 	}
+	// ⛔ The read gate is HERE, at the one point where a handle becomes an
+	// export, so that no procedure can be added later that forgets it.
+	if e.allow != nil {
+		if r, _ := e.allow(c.Principal); !r {
+			return nil, "", StatusAccess, false
+		}
+	}
 	return e, k.path, StatusOK, false
 }
 
 // dirOpArg decodes a diropargs3 (directory handle plus one component).
-func (s *Server) dirOpArg(d *xdr.Decoder) (e *export, dir, full string, st Status, garbage bool) {
-	e, dir, fhSt, garbage := s.fhArg(d)
+func (s *Server) dirOpArg(c *rpc.Call) (e *export, dir, full string, st Status, garbage bool) {
+	e, dir, fhSt, garbage := s.fhArg(c)
 	if garbage {
 		return nil, "", "", StatusOK, true
 	}
@@ -93,7 +99,7 @@ func (s *Server) dirOpArg(d *xdr.Decoder) (e *export, dir, full string, st Statu
 	// leave the decoder pointing at the name while the procedure reads its
 	// *next* argument — and a caller sending a stale handle would get
 	// GARBAGE_ARGS instead of the NFS3ERR_STALE that tells it to re-LOOKUP.
-	name, err := d.String()
+	name, err := c.Args.String()
 	if err != nil {
 		return nil, "", "", StatusOK, true
 	}
@@ -109,7 +115,7 @@ func (s *Server) dirOpArg(d *xdr.Decoder) (e *export, dir, full string, st Statu
 
 // GETATTR (RFC 1813 §3.1).
 func (s *Server) procGetAttr(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -129,7 +135,7 @@ func (s *Server) procGetAttr(c *rpc.Call) rpc.Status {
 
 // LOOKUP (RFC 1813 §3.3).
 func (s *Server) procLookup(c *rpc.Call) rpc.Status {
-	e, dir, full, st, garbage := s.dirOpArg(c.Args)
+	e, dir, full, st, garbage := s.dirOpArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -168,7 +174,7 @@ func (s *Server) procLookup(c *rpc.Call) rpc.Status {
 // it would otherwise attempt and have refused; answering it honestly is what
 // keeps `cp` from failing halfway rather than up front.
 func (s *Server) procAccess(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -190,7 +196,7 @@ func (s *Server) procAccess(c *rpc.Call) rpc.Status {
 		return rpc.StatusSuccess
 	}
 	allowed := access3Read | access3Lookup | access3Execute
-	if !e.ro {
+	if s.mayWrite(c, e) {
 		allowed |= access3Modify | access3Extend | access3Delete
 	}
 	c.Res.Uint32(uint32(StatusOK))
@@ -201,7 +207,7 @@ func (s *Server) procAccess(c *rpc.Call) rpc.Status {
 
 // READLINK (RFC 1813 §3.5).
 func (s *Server) procReadlink(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -232,7 +238,7 @@ func (s *Server) procReadlink(c *rpc.Call) rpc.Status {
 
 // READ (RFC 1813 §3.6).
 func (s *Server) procRead(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -370,16 +376,16 @@ func cookieVerf(names []string) uint64 {
 
 // readdirCommon decodes the arguments shared by READDIR and READDIRPLUS and
 // produces the entry list to resume from.
-func (s *Server) readdirCommon(d *xdr.Decoder) (e *export, path string, names []string, start int, st Status, garbage bool) {
-	e, path, st, garbage = s.fhArg(d)
+func (s *Server) readdirCommon(c *rpc.Call) (e *export, path string, names []string, start int, st Status, garbage bool) {
+	e, path, st, garbage = s.fhArg(c)
 	if garbage {
 		return nil, "", nil, 0, StatusOK, true
 	}
-	cookie, err := d.Uint64()
+	cookie, err := c.Args.Uint64()
 	if err != nil {
 		return nil, "", nil, 0, StatusOK, true
 	}
-	verfBytes, err := d.Fixed(8)
+	verfBytes, err := c.Args.Fixed(8)
 	if err != nil {
 		return nil, "", nil, 0, StatusOK, true
 	}
@@ -434,7 +440,7 @@ func entryPath(dir string, names []string, i int) string {
 // READDIR (RFC 1813 §3.16).
 func (s *Server) procReaddir(c *rpc.Call) rpc.Status {
 	s.fsmu.Lock()
-	e, path, names, start, st, garbage := s.readdirCommon(c.Args)
+	e, path, names, start, st, garbage := s.readdirCommon(c)
 	if garbage {
 		s.fsmu.Unlock()
 		return rpc.StatusGarbageArgs
@@ -510,7 +516,7 @@ func (s *Server) procReaddir(c *rpc.Call) rpc.Status {
 // into one for the whole directory.
 func (s *Server) procReaddirPlus(c *rpc.Call) rpc.Status {
 	s.fsmu.Lock()
-	e, path, names, start, st, garbage := s.readdirCommon(c.Args)
+	e, path, names, start, st, garbage := s.readdirCommon(c)
 	if garbage {
 		s.fsmu.Unlock()
 		return rpc.StatusGarbageArgs
@@ -608,7 +614,7 @@ func (s *Server) procReaddirPlus(c *rpc.Call) rpc.Status {
 
 // FSSTAT (RFC 1813 §3.18).
 func (s *Server) procFsstat(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -639,7 +645,7 @@ func (s *Server) procFsstat(c *rpc.Call) rpc.Status {
 
 // FSINFO (RFC 1813 §3.19).
 func (s *Server) procFsinfo(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}
@@ -676,7 +682,7 @@ func (s *Server) procFsinfo(c *rpc.Call) rpc.Status {
 
 // PATHCONF (RFC 1813 §3.20).
 func (s *Server) procPathconf(c *rpc.Call) rpc.Status {
-	e, path, st, garbage := s.fhArg(c.Args)
+	e, path, st, garbage := s.fhArg(c)
 	if garbage {
 		return rpc.StatusGarbageArgs
 	}

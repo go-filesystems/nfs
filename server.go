@@ -46,6 +46,9 @@ type export struct {
 	ro   bool
 	// total and avail feed FSSTAT. Zero means "unknown"; see [WithCapacity].
 	total, avail uint64
+	// allow, when set, decides per CALLER what this export permits. See
+	// [AllowPrincipal].
+	allow func(principal string) (read, write bool)
 }
 
 // Server is an NFSv3 and MOUNTv3 server.
@@ -384,4 +387,40 @@ func (s *Server) SetTLS(cfg *tls.Config) error {
 	}
 	s.rpcsrv.TLS = cfg
 	return nil
+}
+
+// AllowPrincipal restricts an export to the callers a predicate accepts.
+//
+// It is the option that makes a restricted share servable over NFS at all.
+// Without an authenticator the principal is always empty, so a predicate that
+// refuses the empty string refuses everybody — which is the correct answer,
+// and the reason this is safe to set unconditionally: a server that forgot to
+// configure Kerberos serves nothing rather than serving everything.
+//
+// The predicate is called on EVERY operation, not once at mount. NFSv3 is
+// stateless: there is no session to attach a decision to, a file handle is a
+// bearer token that outlives any mount, and a client that keeps one across a
+// change of policy would otherwise keep the access it had.
+//
+// It must be safe for concurrent use, and it should be cheap: it is on the
+// path of every read.
+func AllowPrincipal(allow func(principal string) (read, write bool)) ExportOption {
+	return func(e *export) { e.allow = allow }
+}
+
+// mayWrite reports whether this caller may change this export.
+//
+// Two gates, and they are not the same question: ro is a property of the
+// EXPORT ("this image is served read-only"), and the predicate is a property
+// of the CALLER ("this person may read but not write"). A share can be
+// writable and still refuse a particular person.
+func (s *Server) mayWrite(c *rpc.Call, e *export) bool {
+	if e.ro {
+		return false
+	}
+	if e.allow == nil {
+		return true
+	}
+	_, w := e.allow(c.Principal)
+	return w
 }
