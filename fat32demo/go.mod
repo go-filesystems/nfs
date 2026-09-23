@@ -4,15 +4,15 @@ go 1.26.4
 
 require (
 	github.com/go-authn/krb5 v0.2.1
-	github.com/go-filesystems/fat32 v0.3.0
+	github.com/go-filesystems/fat32 v0.4.0
 	github.com/go-filesystems/interface v0.3.0
 	github.com/go-filesystems/nfs v0.3.0
 	github.com/jcmturner/gokrb5/v8 v8.4.4
 )
 
 require (
-	github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c // indirect
-	github.com/go-volumes/safeio v0.0.0-20260622072324-7f8eb19f6f8c // indirect
+	github.com/go-volumes/gpt v0.2.0 // indirect
+	github.com/go-volumes/safeio v0.0.0-20260831125406-d8f54b2890d4 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
