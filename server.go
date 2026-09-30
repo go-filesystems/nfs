@@ -47,8 +47,10 @@ type export struct {
 	// total and avail feed FSSTAT. Zero means "unknown"; see [WithCapacity].
 	total, avail uint64
 	// allow, when set, decides per CALLER what this export permits. See
-	// [AllowPrincipal].
-	allow func(principal string) (read, write bool)
+	// [AllowCall] and [AllowPrincipal].
+	allow func(c *rpc.Call) (read, write bool)
+	// requireTLS refuses calls that did not arrive over TLS. See [RequireTLS].
+	requireTLS bool
 }
 
 // Server is an NFSv3 and MOUNTv3 server.
@@ -373,10 +375,15 @@ func (s *Server) authFlavor() (uint32, bool) {
 // the connection, which is what a Linux client mounting with xprtsec=tls
 // expects.
 //
-// It does NOT make TLS required, and it authenticates the MACHINE rather than
-// the person: a certificate says which host is talking, not who. That is a
-// different guarantee from sec=krb5, not a substitute for it, and the two
-// compose — a Kerberos mount over TLS gets both.
+// It does NOT make TLS required — [RequireTLS] does that, per export. And by
+// itself it authenticates the MACHINE rather than the person: a certificate
+// says which host is talking, not who. [Server.SetCertificatePrincipal] is
+// the exception, for certificates that name a user. None of this is a
+// substitute for sec=krb5 on a shared client, and the two compose — a
+// Kerberos mount over TLS gets both.
+//
+// The server offers the ALPN protocol "sunrpc" (RFC 9289 §5.2) unless cfg
+// names protocols of its own.
 //
 // Call it before Serve.
 func (s *Server) SetTLS(cfg *tls.Config) error {
@@ -392,7 +399,8 @@ func (s *Server) SetTLS(cfg *tls.Config) error {
 // AllowPrincipal restricts an export to the callers a predicate accepts.
 //
 // It is the option that makes a restricted share servable over NFS at all.
-// Without an authenticator the principal is always empty, so a predicate that
+// Without an authenticator or a certificate principal (see
+// [Server.SetCertificatePrincipal]) the principal is always empty, so a predicate that
 // refuses the empty string refuses everybody — which is the correct answer,
 // and the reason this is safe to set unconditionally: a server that forgot to
 // configure Kerberos serves nothing rather than serving everything.
@@ -404,8 +412,10 @@ func (s *Server) SetTLS(cfg *tls.Config) error {
 //
 // It must be safe for concurrent use, and it should be cheap: it is on the
 // path of every read.
+//
+// It is [AllowCall] reading only [rpc.Call.Principal].
 func AllowPrincipal(allow func(principal string) (read, write bool)) ExportOption {
-	return func(e *export) { e.allow = allow }
+	return AllowCall(func(c *rpc.Call) (bool, bool) { return allow(c.Principal) })
 }
 
 // mayWrite reports whether this caller may change this export.
@@ -418,9 +428,6 @@ func (s *Server) mayWrite(c *rpc.Call, e *export) bool {
 	if e.ro {
 		return false
 	}
-	if e.allow == nil {
-		return true
-	}
-	_, w := e.allow(c.Principal)
+	_, w := e.permits(c)
 	return w
 }

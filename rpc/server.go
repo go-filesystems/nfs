@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -41,8 +42,15 @@ type Call struct {
 	Prog, Vers, Proc uint32
 	// Cred is the raw credential. It is unauthenticated; see [UnixCred].
 	Cred Auth
-	// Principal is who the client PROVED itself to be, or empty when the
-	// flavour proves nothing — which is every flavour but RPCSEC_GSS.
+	// Principal is who the client PROVED itself to be, or empty when nothing
+	// proved anything.
+	//
+	// Two things can set it. RPCSEC_GSS sets it per call, from the context
+	// the client established. Otherwise — AUTH_NONE and AUTH_UNIX only — it
+	// is the identity [Server.CertPrincipal] derived from the connection's
+	// verified TLS client certificate, if one is configured and it answered.
+	// An RPCSEC_GSS principal always wins over the certificate, which is what
+	// draft-cel-nfsv4-rpc-tls-othername requires.
 	//
 	// Empty and "root" are different answers. A procedure that treats an
 	// unauthenticated call as anonymous is making a policy decision, and it
@@ -124,6 +132,23 @@ type Server struct {
 	//
 	// Set it before Serve: it is read without a lock on every call.
 	Auth Authenticator
+
+	// CertPrincipal, when set, names the caller from the TLS client
+	// certificate, for calls whose flavour proves nothing by itself
+	// (AUTH_NONE and AUTH_UNIX). See [Call.Principal].
+	//
+	// It is called ONCE per connection, right after the handshake, with the
+	// first chain crypto/tls VERIFIED — leaf first. A certificate that was
+	// merely presented is never passed: with a [tls.Config] whose ClientAuth
+	// does not verify (RequestClientCert, RequireAnyClientCert) there is no
+	// verified chain, the function is not called, and the principal stays
+	// empty. Returning ok=false, or an empty principal, also leaves it empty.
+	//
+	// The answer belongs to the connection it was computed on and to nothing
+	// else: it lives in that connection's goroutine and dies with it.
+	//
+	// Set it before Serve.
+	CertPrincipal func(chain []*x509.Certificate) (principal string, ok bool)
 
 	mu       sync.Mutex
 	programs map[uint64]*Program
@@ -254,6 +279,10 @@ func (s *Server) serveConn(raw net.Conn) {
 
 	var req, out []byte
 	var state *tls.ConnectionState
+	// peer is the identity the TLS client certificate carries. It is a local
+	// of THIS goroutine on purpose: nothing another connection runs can read
+	// or overwrite it, so a principal cannot leak from one client to another.
+	var peer string
 	res := make([]byte, 0, 8192)
 	for {
 		var err error
@@ -262,7 +291,7 @@ func (s *Server) serveConn(raw net.Conn) {
 			return
 		}
 		var startTLS bool
-		res, startTLS, err = s.handle(req, res[:0], c.RemoteAddr(), state)
+		res, startTLS, err = s.handle(req, res[:0], c.RemoteAddr(), state, peer)
 		if err != nil {
 			// Nothing sensible can be replied to a message that is not
 			// even a call, so the connection goes.
@@ -281,8 +310,21 @@ func (s *Server) serveConn(raw net.Conn) {
 				return
 			}
 			c, state = upgraded, st
+			peer = s.certPrincipal(st)
 		}
 	}
+}
+
+// certPrincipal asks [Server.CertPrincipal] who a freshly verified TLS peer is.
+func (s *Server) certPrincipal(st *tls.ConnectionState) string {
+	if s.CertPrincipal == nil || len(st.VerifiedChains) == 0 {
+		return ""
+	}
+	p, ok := s.CertPrincipal(st.VerifiedChains[0])
+	if !ok {
+		return ""
+	}
+	return p
 }
 
 // readRecord reassembles one RPC record from its fragments, appending to dst.
@@ -327,7 +369,9 @@ func writeRecord(w io.Writer, body, scratch []byte) ([]byte, error) {
 
 // handle turns one request record into one reply record. A non-nil error
 // means no reply is possible and the connection should be dropped.
-func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionState) ([]byte, bool, error) {
+//
+// peer is the identity of the connection's TLS client certificate, or empty.
+func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionState, peer string) ([]byte, bool, error) {
 	d := xdr.NewDecoder(req)
 	e := xdr.NewEncoder(res)
 	h, err := decodeCall(d, len(req))
@@ -362,6 +406,10 @@ func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionS
 	var wrap func([]byte) []byte
 	switch {
 	case h.cred.Flavor == AuthNull || h.cred.Flavor == AuthUnix:
+		// draft-cel-nfsv4-rpc-tls-othername: an AUTH_NONE or AUTH_SYS
+		// call on a connection whose certificate names someone is executed
+		// AS that someone. The uid in the credential is still not believed.
+		principal = peer
 	case s.Auth != nil && h.cred.Flavor == s.Auth.Flavor():
 		dec := s.Auth.Authenticate(&AuthCall{
 			XID: h.xid, Prog: h.prog, Vers: h.vers, Proc: h.proc,

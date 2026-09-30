@@ -42,6 +42,24 @@ func (s *Server) procMnt(c *rpc.Call) rpc.Status {
 		c.Res.Uint32(mountErrNoEnt)
 		return rpc.StatusSuccess
 	}
+	// A MNT that arrived over TLS is judged like any other call: the
+	// connection says who is asking, and telling a refused caller "mounted"
+	// only to answer NFS3ERR_ACCES to everything after reads as a broken
+	// server.
+	//
+	// ⛔ A MNT in the CLEAR is not judged, and cannot be. The Linux kernel's
+	// MOUNT client (fs/nfs/mount_clnt.c, nfs_mount) builds its RPC client
+	// with authflavor RPC_AUTH_UNIX and no xprtsec, whatever the mount's
+	// sec= and xprtsec= say — so its MNT carries neither a certificate nor a
+	// Kerberos principal, and refusing it would make every restricted export
+	// unmountable from Linux. The root handle it gets is useless without
+	// passing the same gate on every NFS call; see [RequireTLS].
+	if c.TLS != nil {
+		if r, _ := e.permits(c); !r {
+			c.Res.Uint32(mountErrAccess)
+			return rpc.StatusSuccess
+		}
+	}
 	h, err := s.handles.Handle(e.id, "/")
 	if err != nil {
 		c.Res.Uint32(mountErrInval)

@@ -83,6 +83,9 @@ jobs:
         working-directory: nfs
         env:
           KRB5_REQUIRE_JUDGE: "1"
+          # openssl is the judge of the certificate otherName encoding; a
+          # runner without it must fail rather than skip.
+          NFS_REQUIRE_OPENSSL: "1"
         run: go test -mod=mod -race -coverpkg=./... -coverprofile=cover.out -covermode=atomic ./...
 
       - name: Enforce coverage gate
@@ -822,3 +825,210 @@ jobs:
 
           sudo umount /mnt/tls
           echo "unmounted cleanly"
+
+  # ----------------------------------------------------------------------
+  # Mutual TLS, with the caller named by its certificate: the configuration
+  # go-fileshare serves. The kernel client presents a client certificate
+  # carrying FreeBSD's identity otherName (the one rpc.tlsservd -u reads);
+  # the server requires TLS on the export and lets in alice@example.org only.
+  #
+  # Three mounts, each on its own port so the kernel cannot reuse an earlier
+  # mount's connection (on Linux the certificate belongs to the connection
+  # tlshd set up, not to a user — which is exactly the caveat the package
+  # documentation spells out):
+  #   alice, xprtsec=mtls  -> reads the file          (positive control)
+  #   bob,   xprtsec=mtls  -> cannot read it
+  #   no TLS at all        -> cannot read it
+  # and a packet capture of each, which is what shows WHERE the MOUNT call
+  # travels: the kernel's MOUNT client has no TLS (fs/nfs/mount_clnt.c), so
+  # the server has to answer MNT in the clear for any of this to mount.
+  # ----------------------------------------------------------------------
+  live-mount-mtls:
+    name: live mount with mutual TLS and a certificate principal (linux kernel client)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: nfs
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: nfs/fat32demo/go.mod
+      - name: Install the NFS client, tlshd and tcpdump
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nfs-common ktls-utils tcpdump
+          uname -r
+          dpkg -l ktls-utils | tail -1
+      - name: A CA, a server certificate, and one client certificate per person
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pki && cd /tmp/pki
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+            -keyout ca.key -out ca.pem -days 1 -subj "/CN=nfs-mtls-ca" \
+            -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+          issue() { # name subjectAltName extendedKeyUsage
+            openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+              -keyout "$1.key" -out "$1.csr" -subj "/CN=$1" 2>/dev/null
+            printf 'subjectAltName=%s\nextendedKeyUsage=%s\nbasicConstraints=CA:FALSE\n' "$2" "$3" > "$1.ext"
+            openssl x509 -req -in "$1.csr" -CA ca.pem -CAkey ca.key -CAcreateserial \
+              -out "$1.pem" -days 1 -extfile "$1.ext" 2>/dev/null
+          }
+          issue server "DNS:localhost,IP:127.0.0.1" serverAuth
+          issue alice "otherName:1.3.6.1.4.1.2238.1.1.1;UTF8:alice@example.org" clientAuth
+          issue bob "otherName:1.3.6.1.4.1.2238.1.1.1;UTF8:bob@example.org" clientAuth
+          openssl x509 -in alice.pem -noout -ext subjectAltName
+          chmod 644 *.key
+          # tlshd refuses a client certificate or key it does not own
+          # ("File ...: expected owner 0", "expected mode 600") and then
+          # fails the handshake with a gnutls "Error in the certificate",
+          # which names neither.
+          #
+          # And tlshd 0.9's x509 CLIENT handshake (tlshd_client_x509_handshake)
+          # trusts the SYSTEM store only — gnutls_certificate_set_x509_system_trust,
+          # never x509.truststore — so the CA has to go there, or the server
+          # certificate fails verification with the same gnutls -43.
+          sudo cp ca.pem /usr/local/share/ca-certificates/nfs-mtls-ca.crt
+          sudo update-ca-certificates >/dev/null
+          sudo install -d -m 700 -o root -g root /etc/tlshd-pki
+          for who in alice bob; do
+            sudo install -m 644 -o root -g root "$who.pem" /etc/tlshd-pki/
+            sudo install -m 600 -o root -g root "$who.key" /etc/tlshd-pki/
+          done
+      - name: Build an image and the server
+        working-directory: nfs/fat32demo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/live ./mkimg
+          cat > ./mkimg/main.go <<'GO'
+          package main
+
+          import (
+              "log"
+
+              fat32 "github.com/go-filesystems/fat32"
+          )
+
+          func main() {
+              fs, err := fat32.Format("/tmp/live/disk.img", 16<<20, fat32.FormatConfig{Label: "MTLS"})
+              if err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.WriteFile("/HELLO.TXT", []byte("only alice may read this\n"), 0o644); err != nil {
+                  log.Fatal(err)
+              }
+              if err := fs.Close(); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          GO
+          go run -mod=mod ./mkimg
+          rm -rf ./mkimg
+          go build -mod=mod -o /tmp/live/fat32demo .
+      - name: Mount as alice, as bob, and in the clear
+        run: |
+          set -euo pipefail
+          # $1 = client name (or "none"), $2 = port, $3 = extra mount options.
+          # Prints the file's content, or MOUNT-FAILED / READ-FAILED.
+          attempt() {
+            who=$1; port=$2; opts=$3
+            if [ "$who" != none ]; then
+              sudo tee /etc/tlshd.conf >/dev/null <<CONF
+          [debug]
+          loglevel=3
+          tls=3
+          [authenticate]
+          keyrings=.nfs
+          [authenticate.client]
+          x509.truststore=/tmp/pki/ca.pem
+          x509.certificate=/etc/tlshd-pki/$who.pem
+          x509.private_key=/etc/tlshd-pki/$who.key
+          CONF
+              sudo systemctl restart tlshd >/dev/null
+            fi
+            sudo tcpdump -i lo -U -s 0 -w "/tmp/live/$who.pcap" "tcp port $port" 2>/dev/null &
+            dump=$!
+            sleep 1
+            /tmp/live/fat32demo -image /tmp/live/disk.img -addr 127.0.0.1:$port \
+              -tls-cert /tmp/pki/server.pem -tls-key /tmp/pki/server.key \
+              -tls-client-ca /tmp/pki/ca.pem -require-tls -allow alice@example.org \
+              > "/tmp/live/server-$who.log" 2>&1 &
+            srv=$!
+            for i in $(seq 1 50); do
+              if (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then break; fi
+              sleep 0.2
+            done
+            sudo mkdir -p /mnt/$who >/dev/null
+            result=MOUNT-FAILED
+            if sudo timeout 60 mount -t nfs -o vers=3,tcp,port=$port,mountport=$port,nolock,soft,timeo=50,retrans=1$opts \
+                127.0.0.1:/ /mnt/$who >/dev/null 2>"/tmp/live/mount-$who.err"; then
+              grep " /mnt/$who " /proc/mounts > "/tmp/live/proc-$who" || true
+              result=$(sudo timeout 60 cat /mnt/$who/HELLO.TXT 2>"/tmp/live/read-$who.err" || echo READ-FAILED)
+              sudo umount -f /mnt/$who >/dev/null 2>&1 || true
+            fi
+            kill $srv 2>/dev/null || true
+            wait $srv 2>/dev/null || true
+            sleep 1
+            sudo kill $dump 2>/dev/null || true
+            wait $dump 2>/dev/null || true
+            echo "$result"
+          }
+          diagnose() {
+            echo "::group::tlshd"; sudo journalctl -u tlshd --no-pager -n 80 2>/dev/null || true; echo "::endgroup::"
+            for f in /tmp/live/*.log /tmp/live/*.err /tmp/live/proc-*; do
+              [ -f "$f" ] && { echo "::group::$f"; cat "$f"; echo "::endgroup::"; }
+            done
+            echo "::group::kernel"; sudo dmesg | tail -30 || true; echo "::endgroup::"
+          }
+          trap diagnose EXIT
+
+          alice=$(attempt alice 12049 ",xprtsec=mtls")
+          bob=$(attempt bob 12050 ",xprtsec=mtls")
+          plain=$(attempt none 12051 "")
+          echo "alice: $alice"
+          echo "bob:   $bob"
+          echo "plain: $plain"
+
+          # ⛔ The positive control first, and it has to be an mtls mount:
+          # one that quietly fell back to plain TCP would be refused by
+          # -require-tls, and this lane would then "prove" the refusals below
+          # with a server that refused everybody.
+          test "$alice" = "only alice may read this"
+          grep -q 'xprtsec=mtls' /tmp/live/proc-alice || {
+            echo "::error::alice's mount is not using xprtsec=mtls"; cat /tmp/live/proc-alice; exit 1; }
+          case "$bob" in "only alice"*) echo "::error::bob read alice's file"; exit 1;; esac
+          case "$plain" in "only alice"*) echo "::error::a cleartext mount read the file"; exit 1;; esac
+          echo "alice read her file over mtls; bob and a cleartext mount did not"
+      - name: Where did each call travel? (the packet captures)
+        run: |
+          set -euo pipefail
+          sudo chmod 644 /tmp/live/*.pcap
+          python3 - <<'PY'
+          import re, sys
+          # A call header: msg_type CALL (0), rpcvers 2, prog, vers 3, proc.
+          def calls(data, prog):
+              pat = re.compile(rb'\x00\x00\x00\x00\x00\x00\x00\x02' + prog.to_bytes(4, 'big') + rb'\x00\x00\x00\x03(....)', re.S)
+              return [int.from_bytes(m.group(1), 'big') for m in pat.finditer(data)]
+          fail = False
+          for who in ("alice", "bob", "none"):
+              data = open(f"/tmp/live/{who}.pcap", "rb").read()
+              mnt = [p for p in calls(data, 100005) if p == 1]
+              nfs = [p for p in calls(data, 100003) if p != 0]
+              leaked = b"only alice may read this" in data
+              print(f"{who:5}: cleartext MNT calls={len(mnt)}  cleartext NFS calls (proc!=0)={len(nfs)}  file content in the clear={leaked}")
+              if who == "alice":
+                  # The measurement the RequireTLS documentation rests on.
+                  if not mnt:
+                      print("::error::no cleartext MNT seen: the kernel sent MOUNT over TLS, update RequireTLS's documentation"); fail = True
+                  if nfs or leaked:
+                      print("::error::an NFS call or the file travelled in the clear on an mtls mount"); fail = True
+              if who == "none" and not nfs:
+                  # The control: the detector sees a cleartext NFS call when there is one.
+                  print("::error::the capture detector saw no cleartext NFS call on a plain mount"); fail = True
+          sys.exit(1 if fail else 0)
+          PY

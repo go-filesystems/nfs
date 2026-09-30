@@ -71,4 +71,39 @@
 // which address the listener is bound to (bind to loopback unless you mean
 // otherwise), and whether an export is read-only. Do not put this on a
 // public interface expecting the uid fields to protect anything.
+//
+// Two things do prove who is calling: RPCSEC_GSS (sec=krb5, krb5i, krb5p; see
+// [Server.SetAuthenticator]) and, over RPC-with-TLS, a client certificate
+// that names a user (see below). Either one fills
+// [github.com/go-filesystems/nfs/rpc.Call.Principal], which [AllowPrincipal]
+// and [AllowCall] judge on every operation.
+//
+// # RPC-with-TLS and who the caller is
+//
+// [Server.SetTLS] answers the AUTH_TLS probe of RFC 9289 and upgrades the
+// connection; [RequireTLS] makes an export refuse every NFS procedure that did
+// not arrive that way.
+//
+// RFC 9289 itself says a server "cannot utilize the remote TLS peer identity
+// to authenticate RPC users": a certificate names a peer, and the server
+// cannot know whether that peer is one person or a machine shared by many.
+// draft-cel-nfsv4-rpc-tls-othername-04 (an individual draft, September 2026)
+// lifts that for certificates that SAY they name a user: an identity otherName
+// in the SubjectAltName makes the server execute every AUTH_NONE and AUTH_SYS
+// call on that TLS session as that identity, RPCSEC_GSS calls being
+// unaffected, and a certificate with more than one such otherName MUST be
+// rejected. Its OIDs are still unassigned at IANA ([OIDNFSv4Principal]).
+// FreeBSD shipped the idea first under a private OID: rpc.tlsservd(8) -u
+// (--certuser) maps the otherName 1.3.6.1.4.1.2238.1.1.1, a UTF8String
+// "user@domain", to a user, and exports(5) -tlscertuser makes an export
+// require one. [OtherNamePrincipal] reads that encoding
+// ([OIDFreeBSDCertUser]) and [Server.SetCertificatePrincipal] applies it.
+//
+// ⛔ What that identity is worth depends on the CLIENT. On Linux the client
+// certificate belongs to a MOUNT, not to a user: the kernel hands the
+// handshake to tlshd with the certificate and key named on the mount line
+// (keyring serials) or in tlshd.conf, and every user of that machine who
+// touches the mount acts as the certificate's identity. That is sound on a
+// single-user machine. On a shared one it is not, and the answer there is
+// still Kerberos, which authenticates each user separately.
 package nfs

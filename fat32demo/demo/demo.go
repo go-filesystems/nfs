@@ -13,13 +13,17 @@
 package demo
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"slices"
+	"strings"
 
 	"crypto/tls"
+	"crypto/x509"
 
 	"github.com/go-authn/krb5"
 	fat32 "github.com/go-filesystems/fat32"
@@ -95,7 +99,23 @@ func SetupOpts(image, addr string, readWrite, noPositional bool, out io.Writer, 
 	if readWrite {
 		exportOpts = append(exportOpts, nfs.ReadWrite())
 	}
-	if err := applyAuth(srv, opts, out); err != nil {
+	var set settings
+	for _, o := range opts {
+		o(&set)
+	}
+	if set.requireTLS {
+		exportOpts = append(exportOpts, nfs.RequireTLS())
+		fmt.Fprintln(out, "TLS REQUIRED: calls in the clear are refused NFS3ERR_ACCES (MNT and NULL excepted)")
+	}
+	if len(set.allow) > 0 {
+		allow := set.allow
+		exportOpts = append(exportOpts, nfs.AllowPrincipal(func(p string) (bool, bool) {
+			ok := slices.Contains(allow, p)
+			return ok, ok
+		}))
+		fmt.Fprintf(out, "export restricted to %s\n", strings.Join(allow, ", "))
+	}
+	if err := applyAuth(srv, set, out); err != nil {
 		fsys.Close()
 		return nil, nil, err
 	}
@@ -129,6 +149,9 @@ func Main(args []string, out, errOut io.Writer) int {
 		"accept sec=krb5 mounts using the service principals in this keytab (sec=sys stays accepted too)")
 	certFile := fs.String("tls-cert", "", "accept xprtsec=tls mounts with this certificate (plain TCP stays accepted too)")
 	keyFile := fs.String("tls-key", "", "the private key for -tls-cert")
+	clientCA := fs.String("tls-client-ca", "", "verify client certificates against this CA and name the caller from their FreeBSD otherName (needs -tls-cert)")
+	requireTLS := fs.Bool("require-tls", false, "refuse NFS calls that did not arrive over TLS (needs -tls-cert)")
+	allow := fs.String("allow", "", "comma-separated principals the export is restricted to (read and write)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -138,6 +161,15 @@ func Main(args []string, out, errOut io.Writer) int {
 	}
 	if *certFile != "" {
 		opts = append(opts, TLS(*certFile, *keyFile))
+	}
+	if *clientCA != "" {
+		opts = append(opts, ClientCA(*clientCA))
+	}
+	if *requireTLS {
+		opts = append(opts, RequireTLS())
+	}
+	if *allow != "" {
+		opts = append(opts, Allow(strings.Split(*allow, ",")...))
 	}
 	srv, ln, err := SetupOpts(*image, *addr, *rw, *noPositional, out, opts...)
 	if err != nil {
@@ -155,7 +187,28 @@ func Main(args []string, out, errOut io.Writer) int {
 // there was anything to configure keep compiling.
 type Option func(*settings)
 
-type settings struct{ keytab, certFile, keyFile string }
+type settings struct {
+	keytab, certFile, keyFile, clientCA string
+	requireTLS                          bool
+	allow                               []string
+}
+
+// ClientCA makes the server verify client certificates against the CA in
+// path and name each TLS caller from the FreeBSD identity otherName its
+// certificate carries (see [nfs.OtherNamePrincipal]). It needs [TLS].
+func ClientCA(path string) Option { return func(s *settings) { s.clientCA = path } }
+
+// RequireTLS refuses NFS calls that did not arrive over TLS. It needs [TLS].
+func RequireTLS() Option { return func(s *settings) { s.requireTLS = true } }
+
+// Allow restricts the export to the named principals, for reading and
+// writing alike.
+func Allow(principals ...string) Option {
+	return func(s *settings) { s.allow = append(s.allow, principals...) }
+}
+
+// errNeedsTLS reports an option that only means something over TLS.
+var errNeedsTLS = errors.New("-tls-client-ca and -require-tls need -tls-cert")
 
 // Keytab makes the server accept sec=krb5 mounts, using the service
 // principals in the keytab at path.
@@ -166,11 +219,7 @@ type settings struct{ keytab, certFile, keyFile string }
 func Keytab(path string) Option { return func(s *settings) { s.keytab = path } }
 
 // applyAuth is called from SetupOpts once the server exists.
-func applyAuth(srv *nfs.Server, opts []Option, out io.Writer) error {
-	var s settings
-	for _, o := range opts {
-		o(&s)
-	}
+func applyAuth(srv *nfs.Server, s settings, out io.Writer) error {
 	if err := applyTLS(srv, s, out); err != nil {
 		return err
 	}
@@ -203,17 +252,46 @@ func TLS(certFile, keyFile string) Option {
 }
 
 // applyTLS is called from SetupOpts once the server exists.
+// otherName names a verified TLS caller by its FreeBSD identity otherName.
+func otherName(chain []*x509.Certificate) (string, bool) {
+	p, err := nfs.OtherNamePrincipal(chain[0])
+	return p, err == nil
+}
+
 func applyTLS(srv *nfs.Server, s settings, out io.Writer) error {
 	if s.certFile == "" {
+		if s.clientCA != "" || s.requireTLS {
+			return errNeedsTLS
+		}
 		return nil
 	}
 	cert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
 	if err != nil {
 		return err
 	}
-	err = srv.SetTLS(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
-	if err == nil {
-		fmt.Fprintf(out, "xprtsec=tls accepted (certificate %s); plain TCP still accepted\n", s.certFile)
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	var named error
+	if s.clientCA != "" {
+		pem, err := os.ReadFile(s.clientCA)
+		if err != nil {
+			return err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return fmt.Errorf("%s: no certificate in it", s.clientCA)
+		}
+		cfg.ClientAuth, cfg.ClientCAs = tls.VerifyClientCertIfGiven, pool
+		named = srv.SetCertificatePrincipal(otherName)
 	}
-	return err
+	// Both setters fail for one reason only, a server already serving, and
+	// either failing must stop the server rather than leave TLS half on.
+	err = errors.Join(named, srv.SetTLS(cfg))
+	if err != nil {
+		return err
+	}
+	if s.clientCA != "" {
+		fmt.Fprintf(out, "client certificates verified against %s; callers named by their otherName\n", s.clientCA)
+	}
+	fmt.Fprintf(out, "xprtsec=tls accepted (certificate %s); plain TCP still accepted\n", s.certFile)
+	return nil
 }
