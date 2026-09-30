@@ -884,6 +884,15 @@ jobs:
           issue bob "otherName:1.3.6.1.4.1.2238.1.1.1;UTF8:bob@example.org" clientAuth
           openssl x509 -in alice.pem -noout -ext subjectAltName
           chmod 644 *.key
+          # tlshd refuses a client certificate or key it does not own
+          # ("File ...: expected owner 0", "expected mode 600") and then
+          # fails the handshake with a gnutls "Error in the certificate",
+          # which names neither.
+          sudo install -d -m 700 -o root -g root /etc/tlshd-pki
+          for who in alice bob; do
+            sudo install -m 644 -o root -g root "$who.pem" /etc/tlshd-pki/
+            sudo install -m 600 -o root -g root "$who.key" /etc/tlshd-pki/
+          done
       - name: Build an image and the server
         working-directory: nfs/fat32demo
         run: |
@@ -930,8 +939,8 @@ jobs:
           keyrings=.nfs
           [authenticate.client]
           x509.truststore=/tmp/pki/ca.pem
-          x509.certificate=/tmp/pki/$who.pem
-          x509.private_key=/tmp/pki/$who.key
+          x509.certificate=/etc/tlshd-pki/$who.pem
+          x509.private_key=/etc/tlshd-pki/$who.key
           CONF
               sudo systemctl restart tlshd >/dev/null
             fi
