@@ -888,6 +888,13 @@ jobs:
           # ("File ...: expected owner 0", "expected mode 600") and then
           # fails the handshake with a gnutls "Error in the certificate",
           # which names neither.
+          #
+          # And tlshd 0.9's x509 CLIENT handshake (tlshd_client_x509_handshake)
+          # trusts the SYSTEM store only — gnutls_certificate_set_x509_system_trust,
+          # never x509.truststore — so the CA has to go there, or the server
+          # certificate fails verification with the same gnutls -43.
+          sudo cp ca.pem /usr/local/share/ca-certificates/nfs-mtls-ca.crt
+          sudo update-ca-certificates >/dev/null
           sudo install -d -m 700 -o root -g root /etc/tlshd-pki
           for who in alice bob; do
             sudo install -m 644 -o root -g root "$who.pem" /etc/tlshd-pki/
