@@ -80,10 +80,9 @@ func (s *Server) fhArg(c *rpc.Call) (e *export, path string, st Status, garbage 
 	}
 	// ⛔ The read gate is HERE, at the one point where a handle becomes an
 	// export, so that no procedure can be added later that forgets it.
-	if e.allow != nil {
-		if r, _ := e.allow(c.Principal); !r {
-			return nil, "", StatusAccess, false
-		}
+	// RequireTLS is judged here too, for the same reason.
+	if r, _ := e.permits(c); !r {
+		return nil, "", StatusAccess, false
 	}
 	return e, k.path, StatusOK, false
 }

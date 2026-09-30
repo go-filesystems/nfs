@@ -15,6 +15,9 @@ const AuthTLS uint32 = 7
 // reads anything else MUST NOT start a handshake.
 var starttls = []byte("STARTTLS")
 
+// alpnSunRPC is the ALPN protocol id RFC 9289 §5.2 registers for RPC-with-TLS.
+const alpnSunRPC = "sunrpc"
+
 // isTLSProbe reports whether a call is the AUTH_TLS probe, and it is strict
 // on purpose.
 //
@@ -35,7 +38,16 @@ func isTLSProbe(h callHeader) bool {
 // The handshake is performed here rather than lazily on the first read so
 // that a failure closes the connection instead of surfacing as a malformed
 // RPC record several layers up, where it would read like a protocol error.
+//
+// The server offers the ALPN protocol "sunrpc", which RFC 9289 §5.2 makes
+// mandatory, unless the configuration already names protocols of its own.
+// With it, crypto/tls refuses a client that offers ALPN without "sunrpc"; a
+// client that offers no ALPN at all is still served.
 func upgrade(c net.Conn, cfg *tls.Config) (net.Conn, *tls.ConnectionState, error) {
+	if len(cfg.NextProtos) == 0 {
+		cfg = cfg.Clone()
+		cfg.NextProtos = []string{alpnSunRPC}
+	}
 	tc := tls.Server(c, cfg)
 	if err := tc.Handshake(); err != nil {
 		return nil, nil, err

@@ -86,7 +86,7 @@ func TestReadingAndWritingAreSeparateAnswers(t *testing.T) {
 		{"mallory@REALM", false, false},
 		{"", false, false},
 	} {
-		r, _ := e.allow(tc.who)
+		r, _ := e.permits(&rpc.Call{Principal: tc.who})
 		if r != tc.read {
 			t.Errorf("%s may read = %v, want %v", tc.who, r, tc.read)
 		}
