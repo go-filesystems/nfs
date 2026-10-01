@@ -396,3 +396,15 @@ func TestLimitDefaults(t *testing.T) {
 		}
 	}
 }
+
+// TestANilErrorLogUsesTheStandardLogger: a panic is never reported nowhere.
+func TestANilErrorLogUsesTheStandardLogger(t *testing.T) {
+	var logged syncBuffer
+	prev := log.Writer()
+	log.SetOutput(&logged)
+	defer log.SetOutput(prev)
+	(&Server{}).logf("rpc: %s", "reported")
+	if !strings.Contains(logged.String(), "rpc: reported") {
+		t.Fatalf("standard logger got %q", logged.String())
+	}
+}
