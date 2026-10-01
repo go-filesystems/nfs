@@ -107,16 +107,16 @@ func (s *Server) attrFromStat(e *export, path string, st filesystem.Stat) (fattr
 	// FAT32 that is the first cluster — which is 0 for every empty file. A
 	// client that sees two entries share a fileid may treat them as hard
 	// links to one object and serve one's cached data for the other, so a
-	// zero is replaced by a value derived from the handle table slot, which
-	// is unique per path for the life of the process. The top bit marks it
-	// synthetic and keeps it clear of any real inode number.
+	// zero is replaced by a value derived from the path's handle id, which
+	// is the same in every Server holding the handle key. The top bit marks
+	// it synthetic and keeps it clear of any real inode number.
 	a.fileid = st.Inode()
 	if a.fileid == 0 {
-		slot, err := s.handles.slotOf(e.id, path)
+		id, err := s.handles.fileID(e.id, path)
 		if err != nil {
 			return fattr{}, StatusServerFault
 		}
-		a.fileid = 1<<63 | slot
+		a.fileid = id
 	}
 
 	// Timestamps. No driver in the fleet reports one yet, so every file

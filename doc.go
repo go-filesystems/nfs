@@ -78,6 +78,27 @@
 // [github.com/go-filesystems/nfs/rpc.Call.Principal], which [AllowPrincipal]
 // and [AllowCall] judge on every operation.
 //
+// Every connection is bounded before it proves anything: a record buffer
+// grows with the bytes that arrive, not with what a fragment header claims;
+// an idle connection, a half-sent record and a stalled TLS handshake are
+// closed; and the number of connections is capped. See [ConnLimits] for the
+// defaults and [Server.SetConnLimits] to change them. A panic in a procedure
+// is answered SYSTEM_ERR and logged ([Server.SetErrorLog]) rather than
+// taking the process down.
+//
+// ⛔ MOUNT's EXPORT procedure (what `showmount -e` calls) lists every export
+// path, in the clear, to anyone who can reach the port — [RequireTLS]
+// included, because the Linux MOUNT client never speaks TLS (see procMnt).
+// An export path is therefore not a secret; do not put one in it.
+//
+// # File handles across Servers
+//
+// A file handle is authenticated with a key. By default every [Server] draws
+// its own, so a handle is valid only on the Server that minted it. A program
+// that replaces its Server — on a configuration change or across a restart —
+// keeps its clients' handles working by giving each Server the same key with
+// [Server.SetHandleKey] ([NewHandleKey] draws one) and the same export paths.
+//
 // # RPC-with-TLS and who the caller is
 //
 // [Server.SetTLS] answers the AUTH_TLS probe of RFC 9289 and upgrades the

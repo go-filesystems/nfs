@@ -65,24 +65,29 @@ func (s *Server) fhArg(c *rpc.Call) (e *export, path string, st Status, garbage 
 		return nil, "", StatusOK, true
 	}
 	k, stale, ok := s.handles.Resolve(h)
-	if !ok {
-		if stale {
-			return nil, "", StatusStale, false
-		}
+	if !ok && !stale {
 		return nil, "", StatusBadHandle, false
 	}
 	e = s.exportByID(k.export)
 	if e == nil {
-		// The handle authenticated but its export is gone. Only reachable
-		// if exports could be removed; answered as stale because that is
+		// The handle authenticated but names no export this server has:
+		// one removed from the configuration, under a shared key. Stale is
 		// what a client can act on.
 		return nil, "", StatusStale, false
 	}
 	// ⛔ The read gate is HERE, at the one point where a handle becomes an
 	// export, so that no procedure can be added later that forgets it.
-	// RequireTLS is judged here too, for the same reason.
+	// RequireTLS is judged here too, for the same reason. It comes before
+	// rediscover, so a caller the export refuses cannot make it walk.
 	if r, _ := e.permits(c); !r {
 		return nil, "", StatusAccess, false
+	}
+	if stale {
+		path, found := s.rediscover(e, handleID(h))
+		if !found {
+			return nil, "", StatusStale, false
+		}
+		k.path = path
 	}
 	return e, k.path, StatusOK, false
 }

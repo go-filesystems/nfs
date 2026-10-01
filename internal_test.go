@@ -169,35 +169,29 @@ func TestHandleStoreRejects(t *testing.T) {
 		}
 	})
 	t.Run("forged", func(t *testing.T) {
-		// Flip a slot bit and keep the rest: this is the attack the MAC
-		// exists to stop — walking slots to reach an unexported path.
+		// Flip a path-id bit and keep the rest: this is the attack the MAC
+		// exists to stop — reaching a path nobody looked up.
 		bad := append([]byte(nil), good...)
 		bad[27] ^= 0x01
 		if _, _, ok := s.Resolve(bad); ok {
 			t.Fatal("a forged handle resolved")
 		}
 	})
-	t.Run("previous epoch", func(t *testing.T) {
-		other := &handleStore{key: s.key, epoch: s.epoch + 1, max: maxHandles, byPath: map[handleKey]uint64{}}
-		old, _ := other.Handle(1, "/a")
-		_, stale, ok := s.Resolve(old)
-		if ok {
-			t.Fatal("a handle from another epoch resolved")
-		}
-		if !stale {
-			t.Fatal("a handle from another epoch was not reported stale")
+	t.Run("another key", func(t *testing.T) {
+		other, _ := newHandleStore()
+		h, _ := other.Handle(1, "/a")
+		if _, stale, ok := s.Resolve(h); ok || stale {
+			t.Fatalf("a handle under another key: stale=%v ok=%v, want BADHANDLE", stale, ok)
 		}
 	})
-	t.Run("slot past the table", func(t *testing.T) {
-		// Mint with a store that has the same key but more slots, so the MAC
-		// verifies and only the bounds check can reject it.
-		wide := &handleStore{key: s.key, epoch: s.epoch, max: maxHandles, byPath: map[handleKey]uint64{}}
-		for i := range 5 {
-			wide.Handle(1, string(rune('a'+i)))
-		}
-		far, _ := wide.Handle(1, "/far")
-		if _, stale, ok := s.Resolve(far); ok || !stale {
-			t.Fatalf("an out-of-range slot resolved (stale=%v, ok=%v)", stale, ok)
+	t.Run("same key, path never seen here", func(t *testing.T) {
+		// Authentic but unknown: stale, with the export named so the server
+		// can look for the path.
+		twin := newHandleStoreWith(s.key, 0)
+		h, _ := twin.Handle(7, "/elsewhere")
+		k, stale, ok := s.Resolve(h)
+		if ok || !stale || k.export != 7 {
+			t.Fatalf("an unknown authentic handle = (%+v, stale=%v, ok=%v)", k, stale, ok)
 		}
 	})
 }
@@ -219,8 +213,8 @@ func TestHandleStoreFull(t *testing.T) {
 	if _, err := s.Handle(1, "/a"); err != nil {
 		t.Fatalf("known path after overflow: %v", err)
 	}
-	if _, err := s.slotOf(1, "/c"); !errors.Is(err, errHandleFull) {
-		t.Fatalf("slotOf after overflow = %v, want errHandleFull", err)
+	if _, err := s.fileID(1, "/c"); !errors.Is(err, errHandleFull) {
+		t.Fatalf("fileID after overflow = %v, want errHandleFull", err)
 	}
 }
 
@@ -388,7 +382,7 @@ func TestAttrUsesDriverModTime(t *testing.T) {
 	if err := s.Export("/", timedFS{}); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
-	a, st := s.attrFor(s.byID[1], "/f")
+	a, st := s.attrFor(s.byPath["/"], "/f")
 	if st != StatusOK {
 		t.Fatalf("attrFor: %v", st)
 	}
@@ -406,7 +400,7 @@ func TestAttrSyntheticFileIDOverflow(t *testing.T) {
 		t.Fatalf("Export: %v", err)
 	}
 	s.handles.max = 0
-	if _, st := s.attrFor(s.byID[1], "/f"); st != StatusServerFault {
+	if _, st := s.attrFor(s.byPath["/"], "/f"); st != StatusServerFault {
 		t.Fatalf("attrFor with a full handle table = %v, want SERVERFAULT", st)
 	}
 }
@@ -504,29 +498,35 @@ func newTestServer(t *testing.T) (*Server, []byte) {
 	if err := s.Export("/", nopFS{}); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
-	h, err := s.handles.Handle(1, "/")
+	h, err := s.handles.Handle(s.byPath["/"].id, "/")
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	return s, h
 }
 
-// TestStaleHandleAfterRestart: a handle minted by a previous process must be
-// reported stale so the client re-walks from the mount root, never silently
-// resolved to whatever now sits in that slot.
+// TestStaleHandleAfterRestart: an authentic handle for a path that no longer
+// exists must be reported stale so the client re-walks from the mount root,
+// never silently resolved to something else — and one minted under another
+// key (a restart without SetHandleKey) is a bad handle.
 func TestStaleHandleAfterRestart(t *testing.T) {
-	s, h := newTestServer(t)
-	s.handles.epoch++ // exactly what a restart looks like to a client
-	st, d := invoke(s.procGetAttr, fhArgs(h))
+	s, _ := newTestServer(t)
+	twin := newHandleStoreWith(s.handles.key, 0)
+	gone, _ := twin.Handle(s.byPath["/"].id, "/gone")
+	st, d := invoke(s.procGetAttr, fhArgs(gone))
 	if st != rpc.StatusSuccess {
 		t.Fatalf("GETATTR: rpc status %v", st)
 	}
-	got, err := d.Uint32()
-	if err != nil {
-		t.Fatalf("decode: %v", err)
+	if got, _ := d.Uint32(); Status(got) != StatusStale {
+		t.Fatalf("GETATTR for a path that is gone = %v, want STALE", Status(got))
 	}
-	if Status(got) != StatusStale {
-		t.Fatalf("GETATTR with a previous-epoch handle = %v, want STALE", Status(got))
+
+	other, _ := New()
+	other.Export("/", nopFS{})
+	_, h := newTestServer(t)
+	_, d = invoke(other.procGetAttr, fhArgs(h))
+	if got, _ := d.Uint32(); Status(got) != StatusBadHandle {
+		t.Fatalf("GETATTR with another key's handle = %v, want BADHANDLE", Status(got))
 	}
 }
 
@@ -535,7 +535,7 @@ func TestStaleHandleAfterRestart(t *testing.T) {
 func TestHandleForAVanishedExport(t *testing.T) {
 	s, h := newTestServer(t)
 	s.mu.Lock()
-	delete(s.byID, 1)
+	delete(s.byID, s.byPath["/"].id)
 	s.mu.Unlock()
 	_, d := invoke(s.procGetAttr, fhArgs(h))
 	got, _ := d.Uint32()
@@ -579,7 +579,7 @@ func TestHandleTableFullDegradesGracefully(t *testing.T) {
 	})
 	t.Run("CREATE", func(t *testing.T) {
 		s, h := newTestServer(t)
-		s.byID[1].ro = false
+		s.byPath["/"].ro = false
 		s.handles.max = 1
 		e := xdr.NewEncoder(nil)
 		e.Opaque(h)
@@ -609,7 +609,7 @@ func TestNilStatIsAServerFault(t *testing.T) {
 	if err := s.Export("/", nilStatFS{}); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
-	if _, st := s.attrFor(s.byID[1], "/"); st != StatusServerFault {
+	if _, st := s.attrFor(s.byPath["/"], "/"); st != StatusServerFault {
 		t.Fatalf("attrFor on a nil Stat = %v, want SERVERFAULT", st)
 	}
 }

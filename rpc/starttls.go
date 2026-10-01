@@ -3,6 +3,7 @@ package rpc
 import (
 	"crypto/tls"
 	"net"
+	"time"
 )
 
 // AuthTLS is the credential flavour a client uses to ask whether this server
@@ -43,15 +44,22 @@ func isTLSProbe(h callHeader) bool {
 // mandatory, unless the configuration already names protocols of its own.
 // With it, crypto/tls refuses a client that offers ALPN without "sunrpc"; a
 // client that offers no ALPN at all is still served.
-func upgrade(c net.Conn, cfg *tls.Config) (net.Conn, *tls.ConnectionState, error) {
+//
+// timeout, when positive, bounds the handshake; the deadline is lifted again
+// once it succeeds, and the caller sets the next one.
+func upgrade(c net.Conn, cfg *tls.Config, timeout time.Duration) (net.Conn, *tls.ConnectionState, error) {
 	if len(cfg.NextProtos) == 0 {
 		cfg = cfg.Clone()
 		cfg.NextProtos = []string{alpnSunRPC}
 	}
 	tc := tls.Server(c, cfg)
+	if timeout > 0 {
+		_ = c.SetDeadline(time.Now().Add(timeout))
+	}
 	if err := tc.Handshake(); err != nil {
 		return nil, nil, err
 	}
+	_ = c.SetDeadline(time.Time{})
 	st := tc.ConnectionState()
 	return tc, &st, nil
 }
