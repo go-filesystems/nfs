@@ -524,3 +524,6 @@ func (h *halfConn) Read(p []byte) (int, error)  { return h.r.Read(p) }
 func (h *halfConn) Write(p []byte) (int, error) { return 0, errors.New("write failed") }
 func (h *halfConn) Close() error                { return nil }
 func (h *halfConn) RemoteAddr() net.Addr        { return nil }
+
+func (h *halfConn) SetDeadline(time.Time) error      { return nil }
+func (h *halfConn) SetWriteDeadline(time.Time) error { return nil }

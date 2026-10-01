@@ -32,7 +32,7 @@ func TestAnUnauthenticatedCallerIsRefusedARestrictedExport(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	h, err := s.handles.Handle(1, "/")
+	h, err := s.handles.Handle(s.byPath["/private"].id, "/")
 	if err != nil {
 		t.Fatal(err)
 	}

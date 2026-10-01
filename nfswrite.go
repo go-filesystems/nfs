@@ -307,6 +307,20 @@ func (s *Server) procWrite(c *rpc.Call) rpc.Status {
 	return rpc.StatusSuccess
 }
 
+// Bounds on the read-modify-write fallback in [Server.writeAt], which holds the
+// whole file in memory.
+const (
+	// fallbackMaxGrowth is how far past the current end one WRITE may extend
+	// a file. It is generous — a client flushing dirty pages out of order
+	// writes ahead of the end by a few wsize at most — and it is what stops
+	// one call from asking for an arbitrary allocation.
+	fallbackMaxGrowth = 64 * writeMax
+	// fallbackMaxSize is the largest file the fallback will grow. A driver
+	// without positional writes rewrites the whole file on every WRITE, so a
+	// file this size is already far beyond what that path serves usefully.
+	fallbackMaxSize = 1 << 30
+)
+
 // writeAt lands data at off, positionally when the driver allows it.
 //
 // The probe is on the FILE, not on the driver, and that distinction is the
@@ -364,6 +378,16 @@ func (s *Server) writeAt(e *export, path string, off uint64, data []byte, perm o
 	}
 	end := off + uint64(len(data))
 	if end > uint64(len(cur)) {
+		// The fallback materialises the whole file, so the offset decides
+		// the allocation: a WRITE at 2^62 was a make() the runtime refused
+		// with a panic, and one at 2^38 an allocation that took the process
+		// down with it. Growth is therefore bounded — both past the current
+		// end and in absolute size — and refused with NFS3ERR_FBIG, which
+		// is what RFC 1813 gives a write that would make a file larger than
+		// the server can hold.
+		if end-uint64(len(cur)) > fallbackMaxGrowth || end > fallbackMaxSize {
+			return StatusFBig
+		}
 		grown := make([]byte, end)
 		copy(grown, cur)
 		cur = grown

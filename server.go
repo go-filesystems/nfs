@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"io/fs"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -51,6 +52,9 @@ type export struct {
 	allow func(c *rpc.Call) (read, write bool)
 	// requireTLS refuses calls that did not arrive over TLS. See [RequireTLS].
 	requireTLS bool
+	// lastWalk is when [Server.rediscover] last walked this export. It is
+	// guarded by [Server.fsmu], which every walk holds.
+	lastWalk time.Time
 }
 
 // Server is an NFSv3 and MOUNTv3 server.
@@ -74,7 +78,6 @@ type Server struct {
 	mu      sync.Mutex
 	byPath  map[string]*export
 	byID    map[uint64]*export
-	nextID  uint64
 	rpcsrv  *rpc.Server
 	started bool
 }
@@ -139,10 +142,55 @@ func (s *Server) Export(path string, fsys filesystem.Filesystem, opts ...ExportO
 	if _, dup := s.byPath[path]; dup {
 		return ErrExportExists
 	}
-	s.nextID++
-	e.id = s.nextID
+	e.id = s.handles.exportID(path)
+	if _, dup := s.byID[e.id]; dup {
+		// Two export paths whose keyed 64-bit hashes collide. Not a thing
+		// that happens, and refused rather than aliased if it ever does.
+		return ErrExportExists
+	}
 	s.byPath[path] = e
 	s.byID[e.id] = e
+	return nil
+}
+
+// SetHandleKey makes this server mint and accept file handles under key
+// instead of a key of its own, drawn at [New].
+//
+// It is what lets a client's handles outlive the Server that minted them. A
+// program that replaces its Server — on a configuration change, or across a
+// restart — and gives the new one the same key and the same export paths
+// keeps every handle its clients hold working: the new Server finds the path
+// a handle names even if nobody has looked it up there yet (see handle.go).
+// Without it every handle is NFS3ERR_BADHANDLE to the next Server, which a
+// Linux client reports as EIO on every file it has open.
+//
+// key must hold at least [HandleKeySize] bytes ([ErrHandleKey] otherwise);
+// [NewHandleKey] draws one. It is copied. Keep it secret: it authenticates
+// every handle, so whoever holds it can name any file of any export without a
+// LOOKUP. The export gates ([RequireTLS], [AllowCall], [ReadWrite]) are still
+// judged on every call.
+//
+// An export path is what ties a handle to an export, so the same path must
+// publish the same filesystem on both Servers; a handle for a path that is
+// gone is answered NFS3ERR_STALE.
+//
+// Call it before Serve ([ErrServing] after). Exports already added are
+// re-keyed; handles minted before the call are no longer valid.
+func (s *Server) SetHandleKey(key []byte) error {
+	if len(key) < HandleKeySize {
+		return ErrHandleKey
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return ErrServing
+	}
+	s.handles = newHandleStoreWith(key, s.handles.epoch)
+	s.byID = make(map[uint64]*export, len(s.byPath))
+	for _, e := range s.byPath {
+		e.id = s.handles.exportID(e.path)
+		s.byID[e.id] = e
+	}
 	return nil
 }
 
@@ -393,6 +441,55 @@ func (s *Server) SetTLS(cfg *tls.Config) error {
 		return ErrServing
 	}
 	s.rpcsrv.TLS = cfg
+	return nil
+}
+
+// ConnLimits bounds what one client connection may hold. The zero value of
+// each field means the default; a negative value means no bound.
+type ConnLimits struct {
+	// IdleTimeout closes a connection that has not delivered a complete RPC
+	// record for this long. Default [rpc.DefaultIdleTimeout] (5 min): a
+	// Linux client drops its own idle connection after five minutes and
+	// reconnects on demand, so this costs a real client nothing.
+	IdleTimeout time.Duration
+	// HandshakeTimeout bounds the TLS handshake after STARTTLS. Default
+	// [rpc.DefaultHandshakeTimeout] (30 s).
+	HandshakeTimeout time.Duration
+	// MaxConns caps concurrent connections; one past the cap is closed as
+	// soon as it is accepted. Default [rpc.DefaultMaxConns] (1024).
+	MaxConns int
+}
+
+// SetConnLimits replaces the connection limits. Every server has them —
+// the defaults apply without this call — because the connection is where a
+// client that has not yet proved anything can spend the server's memory and
+// goroutines.
+//
+// Call it before Serve.
+func (s *Server) SetConnLimits(l ConnLimits) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return ErrServing
+	}
+	s.rpcsrv.IdleTimeout = l.IdleTimeout
+	s.rpcsrv.HandshakeTimeout = l.HandshakeTimeout
+	s.rpcsrv.MaxConns = l.MaxConns
+	return nil
+}
+
+// SetErrorLog sets where the server reports what it cannot tell a client —
+// a procedure that panicked, answered SYSTEM_ERR, for one. Nil means the log
+// package's standard logger.
+//
+// Call it before Serve.
+func (s *Server) SetErrorLog(l *log.Logger) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return ErrServing
+	}
+	s.rpcsrv.ErrorLog = l
 	return nil
 }
 

@@ -5,9 +5,14 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
+	"runtime/debug"
+	"slices"
 	"sync"
+	"time"
 
 	"github.com/go-filesystems/nfs/xdr"
 )
@@ -90,6 +95,28 @@ type Program struct {
 // otherwise a client could send unlimited 1-byte fragments.
 const maxRecordDefault = 1 << 20
 
+// Defaults for the connection limits on [Server]. Each is generous for an
+// NFS client and finite for anyone else.
+const (
+	// DefaultIdleTimeout is how long a connection may sit without delivering
+	// a complete record. A Linux client closes its own idle transport after
+	// five minutes and reconnects on demand, so a server that does the same
+	// costs a well-behaved client nothing.
+	DefaultIdleTimeout = 5 * time.Minute
+	// DefaultHandshakeTimeout bounds the TLS handshake after STARTTLS.
+	DefaultHandshakeTimeout = 30 * time.Second
+	// DefaultMaxConns caps concurrent connections. A client uses one (the
+	// Linux nconnect option at most 16), so this is room for hundreds of
+	// clients while refusing the thousands of sockets a flood would open.
+	DefaultMaxConns = 1024
+)
+
+// readChunk is the least a record buffer grows by at a time. The buffer never
+// grows by what a fragment header CLAIMS, only by what has arrived: a header
+// is four bytes anyone can send, and trusting it would let a client that
+// sends nothing else make the server allocate a whole record.
+const readChunk = 4096
+
 // lastFragment is the high bit of a record-marking header.
 const lastFragment uint32 = 0x8000_0000
 
@@ -149,6 +176,38 @@ type Server struct {
 	//
 	// Set it before Serve.
 	CertPrincipal func(chain []*x509.Certificate) (principal string, ok bool)
+
+	// IdleTimeout closes a connection that has not delivered a complete
+	// record for this long, and bounds how long writing one reply may block.
+	// Zero means [DefaultIdleTimeout]; a negative value disables it.
+	//
+	// It is also what bounds a client that trickles a record one byte at a
+	// time: the whole record must arrive within one IdleTimeout.
+	//
+	// Set it before Serve.
+	IdleTimeout time.Duration
+
+	// HandshakeTimeout bounds the TLS handshake that follows a STARTTLS
+	// reply. Zero means [DefaultHandshakeTimeout]; a negative value disables
+	// it. Without a bound, a client that is answered STARTTLS and then says
+	// nothing holds its connection, and its goroutine, for ever.
+	//
+	// Set it before Serve.
+	HandshakeTimeout time.Duration
+
+	// MaxConns caps the connections served at once; one accepted past the
+	// cap is closed immediately. Zero means [DefaultMaxConns]; a negative
+	// value removes the cap.
+	//
+	// Set it before Serve.
+	MaxConns int
+
+	// ErrorLog receives what the server cannot report to a client — a
+	// procedure that panicked, for one. Nil means the log package's
+	// standard logger.
+	//
+	// Set it before Serve.
+	ErrorLog *log.Logger
 
 	mu       sync.Mutex
 	programs map[uint64]*Program
@@ -223,6 +282,14 @@ func (s *Server) Serve(ln net.Listener) error {
 		if s.conns == nil {
 			s.conns = make(map[net.Conn]struct{})
 		}
+		if max := s.maxConns(); max > 0 && len(s.conns) >= max {
+			// Refused by closing rather than by not accepting: a listener
+			// that stops accepting leaves the flood queued in the kernel's
+			// backlog, where it still delays every legitimate client.
+			s.mu.Unlock()
+			c.Close()
+			continue
+		}
 		s.conns[c] = struct{}{}
 		s.wg.Add(1)
 		s.mu.Unlock()
@@ -271,6 +338,12 @@ func (s *Server) serveConn(raw net.Conn) {
 	// entry in the table for a connection nobody can close.
 	c := raw
 	defer func() {
+		// A panic outside a procedure — in an Authenticator, say — costs
+		// this connection and nothing more. The one inside a procedure is
+		// caught closer to it, in invoke, and answered.
+		if r := recover(); r != nil {
+			s.logf("rpc: panic serving %v: %v\n%s", raw.RemoteAddr(), r, debug.Stack())
+		}
 		raw.Close()
 		s.mu.Lock()
 		delete(s.conns, raw)
@@ -284,8 +357,14 @@ func (s *Server) serveConn(raw net.Conn) {
 	// or overwrite it, so a principal cannot leak from one client to another.
 	var peer string
 	res := make([]byte, 0, 8192)
+	idle := timeoutOr(s.IdleTimeout, DefaultIdleTimeout)
 	for {
 		var err error
+		if idle > 0 {
+			// A deadline error is an ordinary read error: the loop returns
+			// and the connection goes.
+			_ = c.SetDeadline(time.Now().Add(idle))
+		}
 		req, err = s.readRecord(c, req[:0])
 		if err != nil {
 			return
@@ -297,6 +376,11 @@ func (s *Server) serveConn(raw net.Conn) {
 			// even a call, so the connection goes.
 			return
 		}
+		if idle > 0 {
+			// Re-armed for the reply: the procedure's own time must not eat
+			// into the time the client is given to read it.
+			_ = c.SetWriteDeadline(time.Now().Add(idle))
+		}
 		if out, err = writeRecord(c, res, out); err != nil {
 			return
 		}
@@ -305,7 +389,7 @@ func (s *Server) serveConn(raw net.Conn) {
 			// client send its ClientHello on THIS connection next. Replacing
 			// c means every later read and write goes through TLS, including
 			// the record framing.
-			upgraded, st, err := upgrade(c, s.TLS)
+			upgraded, st, err := upgrade(c, s.TLS, timeoutOr(s.HandshakeTimeout, DefaultHandshakeTimeout))
 			if err != nil {
 				return
 			}
@@ -313,6 +397,56 @@ func (s *Server) serveConn(raw net.Conn) {
 			peer = s.certPrincipal(st)
 		}
 	}
+}
+
+// timeoutOr resolves a timeout field: zero means the default, a negative
+// value means none (returned as zero).
+func timeoutOr(d, def time.Duration) time.Duration {
+	switch {
+	case d == 0:
+		return def
+	case d < 0:
+		return 0
+	}
+	return d
+}
+
+// maxConns resolves [Server.MaxConns]; zero or less from here means no cap.
+func (s *Server) maxConns() int {
+	switch {
+	case s.MaxConns == 0:
+		return DefaultMaxConns
+	case s.MaxConns < 0:
+		return 0
+	}
+	return s.MaxConns
+}
+
+// logf reports through [Server.ErrorLog].
+func (s *Server) logf(format string, args ...any) {
+	l := s.ErrorLog
+	if l == nil {
+		l = log.Default()
+	}
+	l.Output(2, fmt.Sprintf(format, args...))
+}
+
+// invoke runs one procedure, and turns a panic in it into SYSTEM_ERR.
+//
+// A procedure is code this package does not control — the NFS server's, and
+// behind it a driver's — and a panic in it would otherwise unwind the
+// connection goroutine and, unrecovered, kill the whole process: every
+// client of every export, for one bad call. The caller rewinds whatever the
+// procedure had encoded before it panicked, exactly as for any failure.
+func (s *Server) invoke(p Proc, c *Call) (st Status) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logf("rpc: panic in program %d version %d procedure %d from %v: %v\n%s",
+				c.Prog, c.Vers, c.Proc, c.Remote, r, debug.Stack())
+			st = StatusSystemErr
+		}
+	}()
+	return p(c)
 }
 
 // certPrincipal asks [Server.CertPrincipal] who a freshly verified TLS peer is.
@@ -343,10 +477,21 @@ func (s *Server) readRecord(r io.Reader, dst []byte) ([]byte, error) {
 		if len(dst)+n > limit {
 			return dst, errRecordTooLarge
 		}
-		start := len(dst)
-		dst = append(dst, make([]byte, n)...)
-		if _, err := io.ReadFull(r, dst[start:]); err != nil {
-			return dst, err
+		// Read the fragment as it arrives, growing the buffer by at most what
+		// has already been received (and at least readChunk). A reused
+		// buffer with room enough reads the whole fragment in one go.
+		for n > 0 {
+			k := n
+			if room := cap(dst) - len(dst); k > room {
+				k = min(k, max(readChunk, len(dst)))
+				dst = slices.Grow(dst, k)
+			}
+			start := len(dst)
+			dst = dst[:start+k]
+			if _, err := io.ReadFull(r, dst[start:]); err != nil {
+				return dst[:start], err
+			}
+			n -= k
 		}
 		if h&lastFragment != 0 {
 			return dst, nil
@@ -465,7 +610,7 @@ func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionS
 
 	encodeAccepted(e, h.xid, stSuccess, verf)
 	results := e.Len()
-	st := proc(&Call{
+	st := s.invoke(proc, &Call{
 		XID: h.xid, Prog: h.prog, Vers: h.vers, Proc: h.proc,
 		Cred: h.cred, Principal: principal, Args: d, Res: e, Remote: remote,
 		TLS: state,
