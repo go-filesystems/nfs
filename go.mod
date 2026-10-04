@@ -1,6 +1,6 @@
 module github.com/go-filesystems/nfs
 
-go 1.26.4
+go 1.27.1
 
 require (
 	github.com/go-authn/krb5 v0.2.1
