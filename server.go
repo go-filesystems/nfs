@@ -47,6 +47,9 @@ type export struct {
 	ro   bool
 	// total and avail feed FSSTAT. Zero means "unknown"; see [WithCapacity].
 	total, avail uint64
+	// capacity, when set, is asked at every FSSTAT instead; see
+	// [WithCapacityFunc].
+	capacity func() (total, avail uint64)
 	// allow, when set, decides per CALLER what this export permits. See
 	// [AllowCall] and [AllowPrincipal].
 	allow func(c *rpc.Call) (read, write bool)
@@ -100,7 +103,23 @@ func ReadWrite() ExportOption { return func(e *export) { e.ro = false } }
 // no capacity set reports zeros, and the caller who does know (it opened the
 // image, so it knows its size) can say so.
 func WithCapacity(total, avail uint64) ExportOption {
-	return func(e *export) { e.total, e.avail = total, avail }
+	return func(e *export) { e.total, e.avail, e.capacity = total, avail, nil }
+}
+
+// WithCapacityFunc makes FSSTAT ask f for the total and available byte
+// counts at every call, instead of reporting the fixed ones [WithCapacity]
+// sets. It is for an export whose size or free space changes while it is
+// served -- a directory of the host, a quota that is resized -- where a
+// number taken once at Export goes stale with the first write.
+//
+// f runs on the RPC's goroutine, outside the server's lock, once per FSSTAT:
+// it must be safe for concurrent use and must not block, because a client's
+// `df` waits for it. A caller whose numbers are slow to obtain keeps the last
+// ones it has and refreshes them elsewhere. Zero means "unknown", as for
+// [WithCapacity]. Of the two options, the one given last wins; a nil f
+// is the same as never giving this one.
+func WithCapacityFunc(f func() (total, avail uint64)) ExportOption {
+	return func(e *export) { e.capacity = f }
 }
 
 // New returns a Server with no exports.

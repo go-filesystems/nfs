@@ -214,7 +214,10 @@ timeout. That mount is now part of the same job, and must complete.
 **FSSTAT.** There is no statfs in the contract, so an export with no
 [`WithCapacity`](https://pkg.go.dev/github.com/go-filesystems/nfs#WithCapacity)
 reports zeros rather than inventing a plausible number that would make `df`
-confidently wrong.
+confidently wrong. An export whose size or free space changes while it is
+served -- a host directory, a resized quota -- passes
+[`WithCapacityFunc`](https://pkg.go.dev/github.com/go-filesystems/nfs#WithCapacityFunc)
+instead, which FSSTAT asks at every call.
 
 **Timestamps.** No driver reports an mtime, so every file currently carries
 the server's start time. This is visible in `ls -l` and is reported here

@@ -2,6 +2,7 @@ package nfs_test
 
 import (
 	"bytes"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-filesystems/nfs"
@@ -348,5 +349,49 @@ func TestReadOnDirectoryIsISDIR(t *testing.T) {
 	root := w.mount("/")
 	if _, _, st := w.read(root, 0, 16); st != nfs.StatusIsDir {
 		t.Fatalf("READ on a directory = %v, want ISDIR", st)
+	}
+}
+
+// FSSTAT asks WithCapacityFunc at every call, so a number that changes
+// while the export is served -- free space going down as a client writes --
+// is what `df` says; and the option given last wins.
+func TestFsstatAsksCapacityFunc(t *testing.T) {
+	var free atomic.Uint64
+	free.Store(3000)
+	var calls atomic.Int64
+	f := func() (uint64, uint64) { calls.Add(1); return 8192, free.Load() }
+	addr := serve(t, func(s *nfs.Server) {
+		s.Export("/", fixture(), nfs.WithCapacity(4096, 2048), nfs.WithCapacityFunc(f))
+		s.Export("/static", fixture(), nfs.WithCapacityFunc(f), nfs.WithCapacity(4096, 2048))
+		s.Export("/none", fixture(), nfs.WithCapacity(4096, 2048), nfs.WithCapacityFunc(nil))
+	})
+	w := dial(t, addr)
+	fsstat := func(fh []byte) (tbytes, fbytes, abytes uint64) {
+		t.Helper()
+		st, d := w.nfsCall(18, func(e *xdr.Encoder) { e.Opaque(fh) })
+		if st != nfs.StatusOK {
+			t.Fatalf("FSSTAT: %v", st)
+		}
+		w.skipPostOp(d)
+		return w.mustU64(d), w.mustU64(d), w.mustU64(d)
+	}
+	root := w.mount("/")
+	if tb, fb, ab := fsstat(root); tb != 8192 || fb != 3000 || ab != 3000 {
+		t.Fatalf("FSSTAT = %d/%d/%d, want 8192/3000/3000 from the func", tb, fb, ab)
+	}
+	free.Store(1000)
+	if tb, fb, ab := fsstat(root); tb != 8192 || fb != 1000 || ab != 1000 {
+		t.Fatalf("FSSTAT after the free space changed = %d/%d/%d, want 8192/1000/1000", tb, fb, ab)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("the func was asked %d times for 2 FSSTATs", n)
+	}
+	for _, path := range []string{"/static", "/none"} {
+		if tb, fb, ab := fsstat(w.mount(path)); tb != 4096 || fb != 2048 || ab != 2048 {
+			t.Fatalf("%s: FSSTAT = %d/%d/%d, want the fixed 4096/2048/2048", path, tb, fb, ab)
+		}
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("the func was asked by an export that does not use it (%d calls)", n)
 	}
 }
