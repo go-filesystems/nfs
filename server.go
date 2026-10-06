@@ -375,6 +375,10 @@ func statusFor(err error, fallback Status) Status {
 		return StatusNotSupp
 	case errors.Is(err, errHandleFull):
 		return StatusServerFault
+	case errors.Is(err, errQuota):
+		return StatusDQuot
+	case errors.Is(err, errNoSpace):
+		return StatusNoSpc
 	}
 	low := strings.ToLower(err.Error())
 	for _, m := range substringStatus {
