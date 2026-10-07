@@ -25,7 +25,7 @@ func TestAWriteFarPastTheEndIsRefusedNotAllocated(t *testing.T) {
 	}{
 		{"2^62, the makeslice panic", 1 << 62},
 		{"2^40, the out-of-memory", 1 << 40},
-		{"just past the growth bound", 10000 + 64*(1<<17) + 1},
+		{"just past the growth bound", 10000 + 8<<20 + 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, fx := range []struct {

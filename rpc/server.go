@@ -89,11 +89,13 @@ type Program struct {
 }
 
 // maxRecordDefault caps one RPC record. NFSv3 WRITE is the only procedure
-// whose request approaches it, and this server advertises wtmax well below,
-// so a larger record is malformed or hostile. The cap is applied to the
+// whose request approaches it: 1 MiB of data (the wtmax the NFS layer
+// advertises) plus its arguments and credentials, well under 2 MiB, so a
+// larger record is malformed or hostile. The buffer grows as bytes arrive,
+// so the cap is not an allocation a client can ask for by announcing it. The cap is applied to the
 // accumulated size of a multi-fragment record, not to each fragment, because
 // otherwise a client could send unlimited 1-byte fragments.
-const maxRecordDefault = 1 << 20
+const maxRecordDefault = 2 << 20
 
 // Defaults for the connection limits on [Server]. Each is generous for an
 // NFS client and finite for anyone else.
@@ -350,7 +352,7 @@ func (s *Server) serveConn(raw net.Conn) {
 		s.mu.Unlock()
 	}()
 
-	var req, out []byte
+	var req []byte
 	var state *tls.ConnectionState
 	// peer is the identity the TLS client certificate carries. It is a local
 	// of THIS goroutine on purpose: nothing another connection runs can read
@@ -370,7 +372,8 @@ func (s *Server) serveConn(raw net.Conn) {
 			return
 		}
 		var startTLS bool
-		res, startTLS, err = s.handle(req, res[:0], c.RemoteAddr(), state, peer)
+		// The reply starts after room for its record mark: see writeRecord.
+		res, startTLS, err = s.handle(req, res[:markLen], c.RemoteAddr(), state, peer)
 		if err != nil {
 			// Nothing sensible can be replied to a message that is not
 			// even a call, so the connection goes.
@@ -381,7 +384,7 @@ func (s *Server) serveConn(raw net.Conn) {
 			// into the time the client is given to read it.
 			_ = c.SetWriteDeadline(time.Now().Add(idle))
 		}
-		if out, err = writeRecord(c, res, out); err != nil {
+		if err = writeRecord(c, res); err != nil {
 			return
 		}
 		if startTLS {
@@ -499,26 +502,33 @@ func (s *Server) readRecord(r io.Reader, dst []byte) ([]byte, error) {
 	}
 }
 
-// writeRecord frames a reply as a single last fragment.
+// markLen is the size of the record mark in front of every fragment.
+const markLen = 4
+
+// writeRecord frames a reply as a single last fragment. rec is the reply
+// with markLen bytes of room in front of it, which the mark fills.
 //
-// The header and the body go out in one Write. Sending them separately works,
+// The mark and the body go out in one Write. Sending them separately works,
 // but a packet capture of a live mount shows it costing an extra segment per
 // reply — the 4-byte header goes out alone, and every reply becomes two
-// segments the client must reassemble. One buffer, one write.
-func writeRecord(w io.Writer, body, scratch []byte) ([]byte, error) {
-	scratch = binary.BigEndian.AppendUint32(scratch[:0], lastFragment|uint32(len(body)))
-	scratch = append(scratch, body...)
-	_, err := w.Write(scratch)
-	return scratch, err
+// segments the client must reassemble. The room in front is what makes one
+// Write possible without copying the body behind a header: for a READ, that
+// body is up to a megabyte of file data.
+func writeRecord(w io.Writer, rec []byte) error {
+	binary.BigEndian.PutUint32(rec, lastFragment|uint32(len(rec)-markLen))
+	_, err := w.Write(rec)
+	return err
 }
 
-// handle turns one request record into one reply record. A non-nil error
-// means no reply is possible and the connection should be dropped.
+// handle turns one request record into one reply record, appended to what
+// res already holds. A non-nil error means no reply is possible and the
+// connection should be dropped.
 //
 // peer is the identity of the connection's TLS client certificate, or empty.
 func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionState, peer string) ([]byte, bool, error) {
 	d := xdr.NewDecoder(req)
-	e := xdr.NewEncoder(res)
+	e := xdr.AppendEncoder(res)
+	base := len(res)
 	h, err := decodeCall(d, len(req))
 	if err != nil {
 		if errors.Is(err, errBadRPCVersion) {
@@ -618,8 +628,8 @@ func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionS
 	if st != StatusSuccess {
 		// Rewind past whatever the procedure had already written. The header
 		// is fixed-size and identical for every accept_stat, so re-encoding
-		// from zero is exact rather than a patch-up.
-		e.Truncate(0)
+		// from the start is exact rather than a patch-up.
+		e.Truncate(base)
 		encodeAccepted(e, h.xid, uint32(st), verf)
 		return e.Bytes(), false, nil
 	}

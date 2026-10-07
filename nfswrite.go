@@ -314,7 +314,7 @@ const (
 	// a file. It is generous — a client flushing dirty pages out of order
 	// writes ahead of the end by a few wsize at most — and it is what stops
 	// one call from asking for an arbitrary allocation.
-	fallbackMaxGrowth = 64 * writeMax
+	fallbackMaxGrowth = 8 << 20
 	// fallbackMaxSize is the largest file the fallback will grow. A driver
 	// without positional writes rewrites the whole file on every WRITE, so a
 	// file this size is already far beyond what that path serves usefully.

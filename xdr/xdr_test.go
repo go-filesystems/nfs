@@ -2,7 +2,9 @@ package xdr
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"io"
 	"testing"
 )
 
@@ -126,7 +128,7 @@ func TestHostileLength(t *testing.T) {
 	if _, err := NewDecoder([]byte{0xff, 0xff, 0xff, 0xff}).Opaque(); !errors.Is(err, ErrLimit) {
 		t.Fatalf("Opaque with a 4 GiB length = %v, want ErrLimit", err)
 	}
-	if _, err := NewDecoder([]byte{0x00, 0x20, 0x00, 0x00}).Opaque(); !errors.Is(err, ErrLimit) {
+	if _, err := NewDecoder(binary.BigEndian.AppendUint32(nil, DefaultLimit+1)).Opaque(); !errors.Is(err, ErrLimit) {
 		t.Fatalf("Opaque above DefaultLimit = %v, want ErrLimit", err)
 	}
 	if _, err := NewDecoder(make([]byte, 64)).Fixed(-1); !errors.Is(err, ErrLimit) {
@@ -179,5 +181,65 @@ func TestFixedCopiesRatherThanAliases(t *testing.T) {
 	buf[4] = 0xff
 	if got[0] != 1 {
 		t.Fatal("Fixed returned an alias of the decoder's buffer")
+	}
+}
+
+// TestOpaqueFrom: the data is written in place, the length says how much was
+// written, the padding is zero even in a reused buffer, and a fill that fails
+// leaves nothing behind.
+func TestOpaqueFrom(t *testing.T) {
+	dirty := bytes.Repeat([]byte{0xee}, 64)
+	e := NewEncoder(dirty)
+	e.Uint32(7)
+	n, err := e.OpaqueFrom(10, func(b []byte) (int, error) {
+		if len(b) != 10 {
+			t.Fatalf("fill got %d bytes, want 10", len(b))
+		}
+		return copy(b, "abcde"), nil
+	})
+	if err != nil || n != 5 {
+		t.Fatalf("OpaqueFrom = %d, %v; want 5, nil", n, err)
+	}
+	want := NewEncoder(nil)
+	want.Uint32(7)
+	want.Opaque([]byte("abcde"))
+	if !bytes.Equal(e.Bytes(), want.Bytes()) {
+		t.Fatalf("OpaqueFrom encoded % x, want % x", e.Bytes(), want.Bytes())
+	}
+
+	before := e.Len()
+	if _, err := e.OpaqueFrom(8, func([]byte) (int, error) { return 3, io.ErrUnexpectedEOF }); err != io.ErrUnexpectedEOF {
+		t.Fatalf("a failing fill returned %v", err)
+	}
+	if e.Len() != before {
+		t.Fatalf("a failing fill left %d bytes behind", e.Len()-before)
+	}
+
+	// A fill that claims more than it was given is held to what it was given.
+	e = NewEncoder(nil)
+	if n, _ := e.OpaqueFrom(4, func([]byte) (int, error) { return 99, nil }); n != 4 || e.Len() != 8 {
+		t.Fatalf("an overclaiming fill: n=%d len=%d, want 4 and 8", n, e.Len())
+	}
+	e = NewEncoder(nil)
+	if n, _ := e.OpaqueFrom(4, func([]byte) (int, error) { return -1, nil }); n != 0 || e.Len() != 4 {
+		t.Fatalf("a negative fill: n=%d len=%d, want 0 and 4", n, e.Len())
+	}
+}
+
+func TestPutUint32At(t *testing.T) {
+	e := NewEncoder(nil)
+	e.Uint32(0)
+	e.Uint32(0)
+	e.PutUint32At(4, 0x01020304)
+	if got := e.Bytes(); !bytes.Equal(got, []byte{0, 0, 0, 0, 1, 2, 3, 4}) {
+		t.Fatalf("PutUint32At: % x", got)
+	}
+}
+
+func TestAppendEncoderKeepsWhatIsThere(t *testing.T) {
+	e := AppendEncoder([]byte{9, 9, 9, 9})
+	e.Uint32(1)
+	if got := e.Bytes(); !bytes.Equal(got, []byte{9, 9, 9, 9, 0, 0, 0, 1}) {
+		t.Fatalf("AppendEncoder: % x", got)
 	}
 }

@@ -560,7 +560,7 @@ func TestWriteTooLarge(t *testing.T) {
 	w := dial(t, addr)
 	root := w.mount("/")
 	fh, _ := w.lookup(root, "hello.txt")
-	big := bytes.Repeat([]byte("x"), 1<<17+1)
+	big := bytes.Repeat([]byte("x"), 1<<20+1) // wtmax + 1
 	st, _ := w.nfsCall(7, func(e *xdr.Encoder) {
 		e.Opaque(fh)
 		e.Uint64(0)
