@@ -273,8 +273,8 @@ func TestAccessAndInfoProcedures(t *testing.T) {
 		t.Fatalf("FSINFO: %v", st)
 	}
 	w.skipPostOp(d)
-	if rtmax := w.mustU32(d); rtmax != 1<<17 {
-		t.Fatalf("FSINFO rtmax = %d, want %d", rtmax, 1<<17)
+	if rtmax := w.mustU32(d); rtmax != 1<<20 {
+		t.Fatalf("FSINFO rtmax = %d, want %d", rtmax, 1<<20)
 	}
 
 	st, d = w.nfsCall(18, func(e *xdr.Encoder) { e.Opaque(root) })

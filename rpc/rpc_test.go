@@ -473,7 +473,7 @@ func TestRegisterReplaces(t *testing.T) {
 
 // TestWriteRecordError covers the reply path failing mid-write.
 func TestWriteRecordError(t *testing.T) {
-	if _, err := writeRecord(failWriter{}, []byte("x"), nil); err == nil {
+	if err := writeRecord(failWriter{}, []byte("....x")); err == nil {
 		t.Fatal("writeRecord on a failing writer returned nil")
 	}
 }

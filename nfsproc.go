@@ -8,17 +8,21 @@ import (
 
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/nfs/rpc"
+	"github.com/go-filesystems/nfs/xdr"
 )
 
 // Transfer sizes advertised by FSINFO and enforced by READ/WRITE.
 //
-// They are held under the RPC layer's 1 MiB record ceiling with room to
-// spare, so a client that honours FSINFO can never build a request the
-// server will refuse to read — which would otherwise show up as a mount that
-// works until the first large file.
+// 1 MiB is what the Linux client asks for by default (rsize=wsize=1048576)
+// and its ceiling: a smaller rtmax turns one client read into several round
+// trips, and on a fast link the round trips are the cost. They are held under
+// the RPC layer's 2 MiB record ceiling with room to spare, so a client that
+// honours FSINFO can never build a request the server will refuse to read —
+// which would otherwise show up as a mount that works until the first large
+// file.
 const (
-	readMax  = 1 << 17 // 128 KiB
-	writeMax = 1 << 17
+	readMax  = 1 << 20 // 1 MiB
+	writeMax = 1 << 20
 	dirPref  = 1 << 15 // 32 KiB, the preferred READDIR reply size
 )
 
@@ -262,80 +266,100 @@ func (s *Server) procRead(c *rpc.Call) rpc.Status {
 	if count > readMax {
 		count = readMax
 	}
+	// The reply is built as the file is read: status, attributes, then the
+	// data read straight into the reply's own buffer, with the count and eof
+	// in front of it filled in once the read has said what they are.
+	mark := c.Res.Len()
 	s.fsmu.Lock()
 	a, aSt := s.attrFor(e, path)
-	var data []byte
-	var eof bool
 	if aSt != StatusOK {
 		st = aSt
 	} else if a.ftype == ftypeDir {
 		st = StatusIsDir
 	} else {
-		data, eof, st = s.readAt(e, path, off, int(count))
+		c.Res.Uint32(uint32(StatusOK))
+		encodePostOp(c.Res, a, aSt)
+		at := c.Res.Len()
+		c.Res.Uint32(0) // count
+		c.Res.Bool(false)
+		var eof bool
+		var n int
+		n, eof, st = s.readAt(e, path, off, int(count), c.Res)
+		if st == StatusOK {
+			c.Res.PutUint32At(at, uint32(n))
+			if eof {
+				c.Res.PutUint32At(at+4, 1)
+			}
+		}
 	}
 	s.fsmu.Unlock()
 	if st != StatusOK {
+		c.Res.Truncate(mark)
 		c.Res.Uint32(uint32(st))
 		encodePostOp(c.Res, a, aSt)
-		return rpc.StatusSuccess
 	}
-	c.Res.Uint32(uint32(StatusOK))
-	encodePostOp(c.Res, a, aSt)
-	c.Res.Uint32(uint32(len(data)))
-	c.Res.Bool(eof)
-	c.Res.Opaque(data)
 	return rpc.StatusSuccess
 }
 
-// readAt reads one range, using the driver's random-access reader when it has
-// one.
+// readAt reads one range into res, as the opaque data of a READ reply, using
+// the driver's random-access reader when it has one. It returns how many
+// bytes it read and whether they end the file; on a failure it has encoded
+// nothing.
 //
 // # The fallback, and what it costs
 //
 // A driver that does not implement the optional Opener capability is read
 // through ReadFile, which materialises the *entire file* in memory for every
-// READ request. A client streaming a 4 GiB image in 128 KiB reads therefore
-// causes 32768 full-file reads — quadratic time and a 4 GiB allocation each
+// READ request. A client streaming a 4 GiB image in 1 MiB reads therefore
+// causes 4096 full-file reads — quadratic time and a 4 GiB allocation each
 // time. This is correct but only usable for small files; the fix is for the
 // driver to implement OpenFile, not for this module to cache, because a cache
 // would have to guess when the underlying image changed.
 //
 // The caller must hold [Server.fsmu].
-func (s *Server) readAt(e *export, path string, off uint64, count int) ([]byte, bool, Status) {
+func (s *Server) readAt(e *export, path string, off uint64, count int, res *xdr.Encoder) (int, bool, Status) {
 	if e.open != nil {
 		f, err := e.openFile(path)
 		if err != nil {
-			return nil, false, statusFor(err, StatusIO)
+			return 0, false, statusFor(err, StatusIO)
 		}
 		defer f.Close()
 		size := f.Size()
 		if off >= uint64(size) {
-			return nil, true, StatusOK
+			res.Opaque(nil)
+			return 0, true, StatusOK
 		}
 		if remaining := uint64(size) - off; uint64(count) > remaining {
 			count = int(remaining)
 		}
-		buf := make([]byte, count)
-		n, err := f.ReadAt(buf, int64(off))
-		// io.ReaderAt is allowed to return io.EOF together with a full read.
-		if err != nil && !(errors.Is(err, io.EOF) && n == len(buf)) {
-			return nil, false, statusFor(err, StatusIO)
+		n, err := res.OpaqueFrom(count, func(buf []byte) (int, error) {
+			n, err := f.ReadAt(buf, int64(off))
+			// io.ReaderAt is allowed to return io.EOF together with a full read.
+			if err != nil && !(errors.Is(err, io.EOF) && n == len(buf)) {
+				return 0, err
+			}
+			return n, nil
+		})
+		if err != nil {
+			return 0, false, statusFor(err, StatusIO)
 		}
-		return buf[:n], off+uint64(n) >= uint64(size), StatusOK
+		return n, off+uint64(n) >= uint64(size), StatusOK
 	}
 
 	data, err := e.fs.ReadFile(path)
 	if err != nil {
-		return nil, false, statusFor(err, StatusIO)
+		return 0, false, statusFor(err, StatusIO)
 	}
 	if off >= uint64(len(data)) {
-		return nil, true, StatusOK
+		res.Opaque(nil)
+		return 0, true, StatusOK
 	}
 	end := off + uint64(count)
 	if end > uint64(len(data)) {
 		end = uint64(len(data))
 	}
-	return data[off:end], end >= uint64(len(data)), StatusOK
+	res.Opaque(data[off:end])
+	return int(end - off), end >= uint64(len(data)), StatusOK
 }
 
 // listDir enumerates a directory's entry names.

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"slices"
 )
 
 // Errors returned by a Decoder. They are deliberately few and coarse: an RPC
@@ -40,6 +41,11 @@ type Encoder struct {
 // buffer with spare capacity avoids an allocation per reply.
 func NewEncoder(buf []byte) *Encoder { return &Encoder{buf: buf[:0]} }
 
+// AppendEncoder returns an Encoder that appends after what buf already
+// holds. The RPC layer starts a reply four bytes in, so that the record mark
+// goes in front of it without the reply being copied to make room.
+func AppendEncoder(buf []byte) *Encoder { return &Encoder{buf: buf} }
+
 // Bytes returns the encoded message. The slice aliases the Encoder's buffer
 // and stays valid until the next write.
 func (e *Encoder) Bytes() []byte { return e.buf }
@@ -53,6 +59,37 @@ func (e *Encoder) Len() int { return len(e.buf) }
 // to the end of the RPC header and encodes the error, rather than assembling
 // the reply twice.
 func (e *Encoder) Truncate(n int) { e.buf = e.buf[:n] }
+
+// OpaqueFrom encodes a variable-length opaque array of at most limit bytes
+// that fill writes in place: fill is handed limit bytes of the reply itself and
+// returns how many it wrote. A READ reply reads the file straight into its
+// reply this way, rather than into a buffer that is then copied in.
+//
+// When fill fails, nothing is encoded and its error is returned.
+func (e *Encoder) OpaqueFrom(limit int, fill func([]byte) (int, error)) (int, error) {
+	start := len(e.buf)
+	e.buf = slices.Grow(e.buf, 4+limit+3)
+	e.buf = e.buf[:start+4+limit]
+	n, err := fill(e.buf[start+4:])
+	if err != nil {
+		e.buf = e.buf[:start]
+		return 0, err
+	}
+	n = min(max(n, 0), limit)
+	binary.BigEndian.PutUint32(e.buf[start:], uint32(n))
+	e.buf = e.buf[:start+4+n]
+	// The padding is zero on the wire, and a reused buffer is not.
+	for range pad(n) {
+		e.buf = append(e.buf, 0)
+	}
+	return n, nil
+}
+
+// PutUint32At overwrites the 32-bit value encoded at off, for a field whose
+// value is known only once what follows it has been encoded.
+func (e *Encoder) PutUint32At(off int, v uint32) {
+	binary.BigEndian.PutUint32(e.buf[off:], v)
+}
 
 // Uint32 encodes a 32-bit unsigned integer.
 func (e *Encoder) Uint32(v uint32) { e.buf = binary.BigEndian.AppendUint32(e.buf, v) }
@@ -110,9 +147,13 @@ type Decoder struct {
 
 // DefaultLimit is the ceiling applied to a single variable-length item when
 // the caller does not set one. NFSv3 READ/WRITE payloads are negotiated
-// through FSINFO's rtmax/wtmax, which this module keeps well under 1 MiB, so
-// anything larger is a malformed or hostile message.
-const DefaultLimit = 1 << 20
+// through FSINFO's rtmax/wtmax, which this module sets at 1 MiB, and the RPC
+// layer refuses a record over 2 MiB; anything larger is a malformed or
+// hostile message. It is twice wtmax rather than equal to it so that a WRITE
+// just over wtmax decodes and is answered NFS3ERR_INVAL, which a client can
+// act on, rather than GARBAGE_ARGS. The bytes are a slice of the record
+// already read, so the limit is not an allocation a client can ask for.
+const DefaultLimit = 2 << 20
 
 // NewDecoder returns a Decoder reading buf with DefaultLimit.
 func NewDecoder(buf []byte) *Decoder { return &Decoder{buf: buf} }

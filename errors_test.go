@@ -591,11 +591,11 @@ func TestClientIgnoringAdvertisedLimits(t *testing.T) {
 	fh, _ := w.lookup(dirFH, "nested.bin")
 
 	// READ above rtmax.
-	data, _, st := w.read(fh, 0, 1<<20)
+	data, _, st := w.read(fh, 0, 4<<20) // rtmax is 1 MiB
 	if st != nfs.StatusOK {
 		t.Fatalf("READ above rtmax: %v", st)
 	}
-	if len(data) > 1<<17 {
+	if len(data) > 1<<20 {
 		t.Fatalf("READ returned %d bytes, above the advertised rtmax", len(data))
 	}
 
