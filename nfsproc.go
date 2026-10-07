@@ -634,9 +634,13 @@ func (s *Server) procFsstat(c *rpc.Call) rpc.Status {
 	encodePostOp(c.Res, a, aSt)
 	// tbytes / fbytes / abytes. Zero means "unknown" here — see
 	// [WithCapacity] for why nothing is invented.
-	c.Res.Uint64(e.total)
-	c.Res.Uint64(e.avail)
-	c.Res.Uint64(e.avail)
+	total, avail := e.total, e.avail
+	if e.capacity != nil {
+		total, avail = e.capacity()
+	}
+	c.Res.Uint64(total)
+	c.Res.Uint64(avail)
+	c.Res.Uint64(avail)
 	// tfiles / ffiles / afiles: no driver exposes an inode count.
 	c.Res.Uint64(0)
 	c.Res.Uint64(0)
