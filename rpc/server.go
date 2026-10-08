@@ -352,13 +352,17 @@ func (s *Server) serveConn(raw net.Conn) {
 		s.mu.Unlock()
 	}()
 
+	// small is what the connection keeps between calls, while it waits for
+	// the next record. A call that needs more borrows it (see borrow) and
+	// gives it back once its reply is out: a connection doing nothing holds
+	// no large buffer, however large its last call was.
+	small := make([]byte, 0, smallBuffer)
 	var req []byte
 	var state *tls.ConnectionState
 	// peer is the identity the TLS client certificate carries. It is a local
 	// of THIS goroutine on purpose: nothing another connection runs can read
 	// or overwrite it, so a principal cannot leak from one client to another.
 	var peer string
-	res := make([]byte, 0, 8192)
 	idle := timeoutOr(s.IdleTimeout, DefaultIdleTimeout)
 	for {
 		var err error
@@ -367,13 +371,18 @@ func (s *Server) serveConn(raw net.Conn) {
 			// and the connection goes.
 			_ = c.SetDeadline(time.Now().Add(idle))
 		}
-		req, err = s.readRecord(c, req[:0])
+		req, err = s.readRecord(c, small[:0])
 		if err != nil {
 			return
 		}
 		var startTLS bool
 		// The reply starts after room for its record mark: see writeRecord.
+		res := borrow(markLen)
+		if res == nil {
+			res = make([]byte, 0, smallBuffer)
+		}
 		res, startTLS, err = s.handle(req, res[:markLen], c.RemoteAddr(), state, peer)
+		giveBack(req)
 		if err != nil {
 			// Nothing sensible can be replied to a message that is not
 			// even a call, so the connection goes.
@@ -384,7 +393,9 @@ func (s *Server) serveConn(raw net.Conn) {
 			// into the time the client is given to read it.
 			_ = c.SetWriteDeadline(time.Now().Add(idle))
 		}
-		if err = writeRecord(c, res); err != nil {
+		err = writeRecord(c, res)
+		giveBack(res)
+		if err != nil {
 			return
 		}
 		if startTLS {
@@ -486,8 +497,15 @@ func (s *Server) readRecord(r io.Reader, dst []byte) ([]byte, error) {
 		for n > 0 {
 			k := n
 			if room := cap(dst) - len(dst); k > room {
-				k = min(k, max(readChunk, len(dst)))
-				dst = slices.Grow(dst, k)
+				// A buffer a finished call gave back, when one is big enough
+				// for the whole fragment: memory that already exists, so not
+				// an allocation the client asked for by announcing a size.
+				if b := borrow(len(dst) + n); b != nil {
+					dst = append(b, dst...)
+				} else {
+					k = min(k, max(readChunk, len(dst)))
+					dst = slices.Grow(dst, k)
+				}
 			}
 			start := len(dst)
 			dst = dst[:start+k]
@@ -500,6 +518,43 @@ func (s *Server) readRecord(r io.Reader, dst []byte) ([]byte, error) {
 			return dst, nil
 		}
 	}
+}
+
+// smallBuffer is what a connection keeps for itself: enough for every call
+// but a READ or WRITE of real size.
+const smallBuffer = 8 << 10
+
+// buffers holds the buffers finished calls gave back, for the next call that
+// needs one, on any connection. It has no New: borrow returns nil rather
+// than allocate, so the growth of a record buffer still follows the bytes
+// that arrive. The garbage collector empties it of what nobody borrows.
+var buffers sync.Pool // of *[]byte
+
+// borrow returns an empty buffer of at least n bytes of capacity that a
+// finished call gave back, or nil.
+func borrow(n int) []byte {
+	p, _ := buffers.Get().(*[]byte)
+	if p == nil {
+		return nil
+	}
+	if cap(*p) < n {
+		buffers.Put(p)
+		return nil
+	}
+	return (*p)[:0]
+}
+
+// giveBack lends b to the next call, unless it is no larger than what a
+// connection keeps for itself -- which is how a connection's own small
+// buffer is never given away -- or larger than any call needs. The bytes in
+// it are never read again: every user of a borrowed buffer appends from
+// length zero.
+func giveBack(b []byte) {
+	if cap(b) <= smallBuffer || cap(b) > 2*maxRecordDefault {
+		return
+	}
+	b = b[:0]
+	buffers.Put(&b)
 }
 
 // markLen is the size of the record mark in front of every fragment.
