@@ -159,8 +159,17 @@ server, and both are measured rather than assumed:
 (`OpenFile(path) (File, error)` returning an `io.ReaderAt`) is read at the
 offset the client asked for. A driver *without* it is read through `ReadFile`,
 which materialises the **entire file** for every READ — so streaming a 4 GiB
-image in 128 KiB reads costs 32768 full-file reads. Correct, but only usable
+image in 1 MiB reads costs 4096 full-file reads. Correct, but only usable
 for small files.
+
+**Transfer size.** FSINFO offers 1 MiB for `rtmax`/`wtmax` (since v0.8.0;
+128 KiB before), which is the Linux client's default `rsize`/`wsize`: one
+client read is one round trip, not eight. The RPC layer accepts a record of
+up to 2 MiB, so a WRITE just over `wtmax` still decodes and is answered
+`NFS3ERR_INVAL`. A READ reads the file straight into its reply and the reply
+goes out behind its record mark without being copied again. Measured with
+go-fileshare/fileshare's `TestThroughputAgainstTheHost`, before and after
+interleaved: about ×2.6 with one client and ×3.3 with four.
 
 **Writes.** A driver whose `OpenFile` returns a
 [`filesystem.WritableFile`](https://pkg.go.dev/github.com/go-filesystems/interface#WritableFile)
