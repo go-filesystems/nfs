@@ -1,8 +1,8 @@
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/go-authn/krb5 v0.3.0 h1:tWD223zEcyv7YH5WdRiaLoKyo5ikwMXvXL9vxNE6ELA=
-github.com/go-authn/krb5 v0.3.0/go.mod h1:NYYsSfrU+qcH/Y/F6HE/3LMFw4JHqvBIaeshi9AdI+Q=
+github.com/go-authn/krb5 v0.3.1 h1:ooMfBzXuJjy9ixRdIjcnsQsZI/zQfjPATBuCgZ2wM2k=
+github.com/go-authn/krb5 v0.3.1/go.mod h1:NYYsSfrU+qcH/Y/F6HE/3LMFw4JHqvBIaeshi9AdI+Q=
 github.com/go-filesystems/interface v0.5.0 h1:AsbSXYG5cp497Ki0Ez88s8wwrVEmeRmFLd40T4d3UwA=
 github.com/go-filesystems/interface v0.5.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
 github.com/gorilla/securecookie v1.1.1 h1:miw7JPhV+b/lAHSXz4qd/nN9jRiAFV5FwjeKyCS8BvQ=
