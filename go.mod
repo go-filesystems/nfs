@@ -3,7 +3,7 @@ module github.com/go-filesystems/nfs
 go 1.27.1
 
 require (
-	github.com/go-authn/krb5 v0.3.0
+	github.com/go-authn/krb5 v0.3.1
 	github.com/go-filesystems/interface v0.5.0
 	github.com/jcmturner/gokrb5/v8 v8.4.4
 )
