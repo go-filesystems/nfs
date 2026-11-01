@@ -255,6 +255,14 @@ enters the path space — the single component in a `diropargs3` — is validate
 in one place, with `..` clamped at the export root so no sequence of lookups
 can name anything above it.
 
+With `sec=krb5`, the server holds at most `rpcgss.Server.MaxContexts` security
+contexts (zero: `DefaultMaxContexts`, 4096). Before this cap a client with one
+valid ticket could INIT in a loop and abandon every context, and the server
+kept them all: a context left only on DESTROY or when its expired handle was
+next used. At the cap, expired contexts are swept, and a new INIT that still
+finds no room is answered `GSS_S_FAILURE` in its results (RFC 2203 §5.2.3),
+which a client reads as "try again", not as a bad credential.
+
 ## Verification
 
 `go test` drives the server **through the wire**, not through its Go API: an

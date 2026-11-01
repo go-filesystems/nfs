@@ -102,6 +102,69 @@ func TestSigningFailureDoesNotEstablishAContext(t *testing.T) {
 	if got := s.Authenticate(initCall(nil)).Reject; got != statCtxProblem {
 		t.Errorf("Reject = %d, want %d (CTXPROBLEM)", got, statCtxProblem)
 	}
+	// The test's name was a promise its body did not check: the context used
+	// to be stored before signing and left behind when signing failed.
+	if n := s.Contexts(); n != 0 {
+		t.Errorf("a context the client was never told about is still held: %d", n)
+	}
+}
+
+// A client with one valid ticket could INIT in a loop and abandon each
+// context; nothing but DESTROY or a later use of an expired handle ever
+// removed one. The server now holds at most MaxContexts.
+func TestTheServerHoldsAtMostMaxContexts(t *testing.T) {
+	s := newServer(fakeAcceptor{ctx: &fakeContext{principal: "alice@X"}})
+	s.MaxContexts = 3
+	for i := 0; i < 3; i++ {
+		if dec := s.Authenticate(initCall(nil)); dec.Reject != 0 || dec.Reply == nil {
+			t.Fatalf("INIT %d refused: %+v", i, dec.Reject)
+		}
+	}
+	dec := s.Authenticate(initCall(nil))
+	if dec.Reject != 0 || dec.Verf.Body != nil {
+		t.Fatalf("a full server must answer in the results, unsigned: reject %d", dec.Reject)
+	}
+	e := xdr.NewEncoder(nil)
+	dec.Reply(e)
+	d := xdr.NewDecoder(e.Bytes())
+	if _, err := d.Opaque(); err != nil { // handle: empty
+		t.Fatal(err)
+	}
+	if major, _ := d.Uint32(); major != gssFailure {
+		t.Fatalf("gss_major = %d, want GSS_S_FAILURE", major)
+	}
+	if n := s.Contexts(); n != 3 {
+		t.Fatalf("held %d contexts, want 3", n)
+	}
+}
+
+// At the cap, expired contexts make room before anything is refused.
+func TestExpiredContextsMakeRoomAtTheCap(t *testing.T) {
+	expired := &fakeContext{principal: "alice@X", expires: time.Now().Add(-time.Second)}
+	s := newServer(fakeAcceptor{ctx: expired})
+	s.MaxContexts = 2
+	s.Authenticate(initCall(nil))
+	s.Authenticate(initCall(nil))
+	s.acceptor = fakeAcceptor{ctx: &fakeContext{principal: "bob@X"}}
+	if dec := s.Authenticate(initCall(nil)); dec.Verf.Body == nil {
+		t.Fatal("a full server holding only expired contexts refused a new one")
+	}
+	if n := s.Contexts(); n != 1 {
+		t.Fatalf("held %d contexts, want the 1 live one", n)
+	}
+}
+
+// Zero means the default, not "no context at all".
+func TestZeroMaxContextsMeansTheDefault(t *testing.T) {
+	s := newServer(fakeAcceptor{ctx: &fakeContext{principal: "alice@X"}})
+	for i := 0; i < 10; i++ {
+		if dec := s.Authenticate(initCall(nil)); dec.Verf.Body == nil {
+			t.Fatalf("INIT %d refused with MaxContexts 0", i)
+		}
+	}
+	if DefaultMaxContexts < 10 {
+		t.Fatal("the default is meant to cover thousands of clients")
+	}
 }
 
 func TestSigningFailureOnADataReply(t *testing.T) {
