@@ -1,10 +1,10 @@
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/go-authn/krb5 v0.3.1 h1:ooMfBzXuJjy9ixRdIjcnsQsZI/zQfjPATBuCgZ2wM2k=
-github.com/go-authn/krb5 v0.3.1/go.mod h1:NYYsSfrU+qcH/Y/F6HE/3LMFw4JHqvBIaeshi9AdI+Q=
-github.com/go-filesystems/fat32 v0.5.1 h1:ifXNmRc3Tv32YsJ92usmojnw29H60TV0CWyjuNYYzX8=
-github.com/go-filesystems/fat32 v0.5.1/go.mod h1:1X9zusWgWQsowu/PVMDDzXNwRa3yVLjPm9wvAg21m5I=
+github.com/go-authn/krb5 v0.3.3 h1:5thncLc/aBDZN+W9iCMUUHDovpYoPzzB/zK2rrvvC2A=
+github.com/go-authn/krb5 v0.3.3/go.mod h1:w0byrdEQ7nEjbJl/mzlyIPFl0yhjFV/nBXXbYxt7nu8=
+github.com/go-filesystems/fat32 v0.7.1 h1:E4dETy1/HoW7x/dswuWhgKMMXeURgto7vfI3GiggP88=
+github.com/go-filesystems/fat32 v0.7.1/go.mod h1:1X9zusWgWQsowu/PVMDDzXNwRa3yVLjPm9wvAg21m5I=
 github.com/go-filesystems/interface v0.5.0 h1:AsbSXYG5cp497Ki0Ez88s8wwrVEmeRmFLd40T4d3UwA=
 github.com/go-filesystems/interface v0.5.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
 github.com/go-volumes/gpt v0.3.0 h1:ZA33VVlmlkA47fFY+BkFylsufqq1TBoASIuBmri+xsw=
@@ -14,8 +14,9 @@ github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b/go.mod h1:Xitv1B
 github.com/gorilla/securecookie v1.1.1/go.mod h1:ra0sb63/xPlUeL+yeDciTfxMRAA+MP+HVt/4epWDjd4=
 github.com/gorilla/sessions v1.2.1/go.mod h1:dk2InVEVJ0sfLlnXv9EAgkf6ecYs/i80K/zI+bUmuGM=
 github.com/hashicorp/go-uuid v1.0.2/go.mod h1:6SBZvOh/SIDV7/2o3Jml5SYk/TvGqwFJ/bN7x4byOro=
-github.com/hashicorp/go-uuid v1.0.3 h1:2gKiV6YVmrJ1i2CKKa9obLvRieoRGviZFL26PcT/Co8=
 github.com/hashicorp/go-uuid v1.0.3/go.mod h1:6SBZvOh/SIDV7/2o3Jml5SYk/TvGqwFJ/bN7x4byOro=
+github.com/hashicorp/go-uuid v1.0.4 h1:ZrN80XjMzpRYk+2FxMDy2A2zz0d5QjJ7GMFSkZLj12A=
+github.com/hashicorp/go-uuid v1.0.4/go.mod h1:x2Ds7vSkQ2n/yQj8Synnxmt0zt1l26uCAjxIhChisLU=
 github.com/jcmturner/aescts/v2 v2.0.0 h1:9YKLH6ey7H4eDBXW8khjYslgyqG2xZikXP0EQFKrle8=
 github.com/jcmturner/aescts/v2 v2.0.0/go.mod h1:AiaICIRyfYg35RUkr8yESTqvSy7csK90qZ5xfvvsoNs=
 github.com/jcmturner/dnsutils/v2 v2.0.0 h1:lltnkeZGL0wILNvrNiVCR6Ro5PGU/SeBvVO/8c/iPbo=
