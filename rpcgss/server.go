@@ -17,6 +17,11 @@ import (
 // a client sizes its pipelining around whatever it is told.
 const defaultWindow uint32 = 128
 
+// DefaultMaxContexts is the most security contexts a [Server] holds when
+// MaxContexts is zero. A context is a few hundred bytes plus its keys; 4096
+// covers thousands of clients, each of which normally holds one per mount.
+const DefaultMaxContexts = 4096
+
 // handleLen is the length of a context handle. It is opaque to the client,
 // which only echoes it back, so its only job is to be unguessable.
 const handleLen = 16
@@ -32,6 +37,11 @@ const handleLen = 16
 type Server struct {
 	acceptor acceptor
 	window   uint32
+
+	// MaxContexts caps how many security contexts are held at once. Zero
+	// means [DefaultMaxContexts]. At the cap, expired contexts are dropped
+	// and, if none was, a new INIT is answered GSS_S_FAILURE.
+	MaxContexts int
 
 	mu       sync.Mutex
 	contexts map[string]*context
@@ -107,25 +117,32 @@ func (s *Server) init(c *rpc.AuthCall, cr cred) rpc.AuthDecision {
 		}}
 	}
 
+	// RFC 2203 §5.2.3.1: the verifier on a successful creation reply is a
+	// signature over the sequence window, which is how the client learns the
+	// window it was told is the window the server meant. Signed BEFORE the
+	// context is kept: it used to be kept first and left behind when signing
+	// failed, a context the client was never told about and would never use
+	// or destroy.
+	verf, err := gss.MIC(be32(s.window))
+	if err != nil {
+		return rpc.AuthDecision{Reject: statCtxProblem}
+	}
 	handle := make([]byte, handleLen)
 	if _, err := randRead(handle); err != nil {
 		return rpc.AuthDecision{Reject: statCtxProblem}
 	}
-	s.mu.Lock()
-	s.contexts[string(handle)] = &context{
+	if !s.keep(handle, &context{
 		gss:     gss,
 		window:  newSeqWindow(s.window),
 		service: cr.service,
 		expires: gss.Expires(),
-	}
-	s.mu.Unlock()
-
-	// RFC 2203 §5.2.3.1: the verifier on a successful creation reply is a
-	// signature over the sequence window, which is how the client learns the
-	// window it was told is the window the server meant.
-	verf, err := gss.MIC(be32(s.window))
-	if err != nil {
-		return rpc.AuthDecision{Reject: statCtxProblem}
+	}) {
+		// Full: reported in the RESULTS, like a refused ticket (§5.2.3), so
+		// the client sees GSS_S_FAILURE and can retry later rather than
+		// concluding its credential was malformed.
+		return rpc.AuthDecision{Reply: func(e *xdr.Encoder) {
+			encodeInitRes(e, nil, gssFailure, 0, 0, nil)
+		}}
 	}
 	return rpc.AuthDecision{
 		Verf:      rpc.Auth{Flavor: Flavor, Body: verf},
@@ -221,6 +238,35 @@ func (s *Server) data(c *rpc.AuthCall, cr cred) rpc.AuthDecision {
 		dec.Reply = func(*xdr.Encoder) {}
 	}
 	return dec
+}
+
+// keep stores a new context unless the server already holds as many as
+// MaxContexts allows; expired ones are swept first, and only when the server
+// is full, so the sweep costs nothing in normal operation.
+//
+// ⛔ Without a cap the map only shrank on DESTROY or when an expired handle
+// was next used: a client with one valid ticket could INIT in a loop and
+// abandon each context, and the server held every one of them.
+func (s *Server) keep(handle []byte, ctx *context) bool {
+	max := s.MaxContexts
+	if max <= 0 {
+		max = DefaultMaxContexts
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.contexts) >= max {
+		now := time.Now()
+		for h, c := range s.contexts {
+			if !c.expires.IsZero() && now.After(c.expires) {
+				delete(s.contexts, h)
+			}
+		}
+		if len(s.contexts) >= max {
+			return false
+		}
+	}
+	s.contexts[string(handle)] = ctx
+	return true
 }
 
 // drop forgets a context.
