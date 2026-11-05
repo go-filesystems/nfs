@@ -697,7 +697,8 @@ func TestCapabilityFailures(t *testing.T) {
 					e.Bool(false)
 					e.Bool(true)
 					e.Uint32(1)
-					e.Bool(false)
+					e.Bool(true) // the gid too: one field alone is NOTSUPP without an OwnerReader
+					e.Uint32(1)
 					e.Bool(false)
 					e.Uint32(0)
 					e.Uint32(0)

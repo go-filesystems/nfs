@@ -142,7 +142,27 @@ func (s *Server) applySattr(e *export, path string, a sattr) Status {
 		}
 	}
 	if a.uidSet || a.gidSet {
-		if err := m.Chown(path, a.uid, a.gid); err != nil {
+		uid, gid := a.uid, a.gid
+		if !(a.uidSet && a.gidSet) {
+			// RFC 1813 3.3.2: a field that is not set is not changed. Chown takes
+			// both, so the other one is read; with no way to read it the change
+			// is refused, never made with a 0 the client did not send.
+			r, ok := e.fs.(OwnerReader)
+			if !ok {
+				return StatusNotSupp
+			}
+			cu, cg, err := r.Owner(path)
+			if err != nil {
+				return statusFor(err, StatusIO)
+			}
+			if !a.uidSet {
+				uid = cu
+			}
+			if !a.gidSet {
+				gid = cg
+			}
+		}
+		if err := m.Chown(path, uid, gid); err != nil {
 			return statusFor(err, StatusIO)
 		}
 	}
