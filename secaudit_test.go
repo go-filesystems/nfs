@@ -4,10 +4,12 @@ package nfs_test
 // trace what the server asks of the driver.
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/nfs"
 	"github.com/go-filesystems/nfs/xdr"
 )
@@ -168,4 +170,76 @@ func TestSetAttrUIDAloneLeavesTheGIDAlone(t *testing.T) {
 			t.Errorf("Chown calls = %v", got)
 		}
 	})
+}
+
+// shiftyFS misbehaves in the ways the bound has to survive: its second Stat of
+// a path fails, or ReadFile returns more than Stat said.
+type shiftyFS struct {
+	*memFS
+	mu       sync.Mutex
+	stats    map[string]int
+	failStat string // the second Stat of this path fails
+	growBy   int    // ReadFile of this path returns this many extra bytes
+}
+
+func (s *shiftyFS) Stat(path string) (filesystem.Stat, error) {
+	s.mu.Lock()
+	s.stats[path]++
+	n := s.stats[path]
+	s.mu.Unlock()
+	if path == s.failStat && n == 2 {
+		return nil, errors.New("shifty: stat failed")
+	}
+	return s.memFS.Stat(path)
+}
+
+func (s *shiftyFS) ReadFile(path string) ([]byte, error) {
+	b, err := s.memFS.ReadFile(path)
+	if err == nil && s.growBy > 0 {
+		b = append(b, make([]byte, s.growBy)...)
+	}
+	return b, err
+}
+
+func TestFallbackBoundSurvivesAMisbehavingDriver(t *testing.T) {
+	t.Run("the size check fails", func(t *testing.T) {
+		s := &shiftyFS{memFS: fixture(), stats: map[string]int{}, failStat: "/hello.txt"}
+		addr := serve(t, func(sv *nfs.Server) { sv.Export("/", s) })
+		w := dial(t, addr)
+		fh, _ := w.lookup(w.mount("/"), "hello.txt")
+		s.mu.Lock()
+		s.stats["/hello.txt"] = 0 // count from the READ on: LOOKUP and GETATTR stat it too
+		s.mu.Unlock()
+		if _, _, st := w.read(fh, 0, 4); st != nfs.StatusIO {
+			t.Errorf("READ whose size check fails = %v, want IO", st)
+		}
+	})
+	t.Run("the file grows past the bound after the check", func(t *testing.T) {
+		s := &shiftyFS{memFS: fixture(), stats: map[string]int{}, growBy: 4096}
+		addr := serve(t, func(sv *nfs.Server) { sv.Export("/", s, nfs.WithMaxFallbackRead(1024)) })
+		w := dial(t, addr)
+		fh, _ := w.lookup(w.mount("/"), "hello.txt")
+		if _, _, st := w.read(fh, 0, 4); st != nfs.StatusIO {
+			t.Errorf("READ of a file that outgrew the bound = %v, want IO", st)
+		}
+	})
+}
+
+// ownerErrFS has an OwnerReader that fails.
+type ownerErrFS struct{ *ownFS }
+
+func (o ownerErrFS) Owner(path string) (uint32, uint32, error) { return 0, 0, errors.New("no owner") }
+
+func TestSetAttrOwnerReaderFailure(t *testing.T) {
+	o := &ownFS{capFS: &capFS{memFS: fixture()}}
+	addr := serve(t, func(s *nfs.Server) { s.Export("/", ownerErrFS{o}, nfs.ReadWrite()) })
+	w := dial(t, addr)
+	fh, _ := w.lookup(w.mount("/"), "hello.txt")
+	uid := uint32(1000)
+	if st, _ := w.nfsCall(2, func(e *xdr.Encoder) { e.Opaque(fh); sattrOwner(&uid, nil)(e); e.Bool(false) }); st != nfs.StatusIO {
+		t.Errorf("SETATTR whose owner cannot be read = %v, want IO", st)
+	}
+	if len(o.got()) != 0 {
+		t.Errorf("Chown called after a failed owner read: %v", o.got())
+	}
 }
