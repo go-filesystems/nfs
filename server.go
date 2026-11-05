@@ -45,6 +45,9 @@ type export struct {
 	// WritableFile — WRITE at an offset too.
 	open Opener
 	ro   bool
+	// maxFallbackRead bounds the size of a file READ may load whole through
+	// ReadFile (a driver with no OpenFile). See [WithMaxFallbackRead].
+	maxFallbackRead int64
 	// total and avail feed FSSTAT. Zero means "unknown"; see [WithCapacity].
 	total, avail uint64
 	// capacity, when set, is asked at every FSSTAT instead; see
@@ -92,6 +95,21 @@ type ExportOption func(*export)
 // most of what this module is pointed at is a forensic or build artefact,
 // and an accidental write to one is unrecoverable.
 func ReadWrite() ExportOption { return func(e *export) { e.ro = false } }
+
+// DefaultMaxFallbackRead is the largest file a READ loads whole, through
+// ReadFile, from a driver that has no OpenFile (64 MiB).
+const DefaultMaxFallbackRead = 64 << 20
+
+// WithMaxFallbackRead bounds the size of a file that READ serves by loading it
+// whole, which is what a driver with no OpenFile (no random-access reader)
+// forces: every READ request, even of a few bytes, reads and allocates the
+// entire file under the server's lock, so a client reading a large file can
+// exhaust memory and hold every other client up. A READ of a larger file
+// answers NFS3ERR_IO. n == 0 is [DefaultMaxFallbackRead], n < 0 lifts the
+// bound. The remedy for a large file is for the driver to implement OpenFile.
+func WithMaxFallbackRead(n int64) ExportOption {
+	return func(e *export) { e.maxFallbackRead = n }
+}
 
 // WithCapacity sets the total and available byte counts reported by FSSTAT
 // (what `df` prints).

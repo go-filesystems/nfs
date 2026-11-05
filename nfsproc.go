@@ -346,9 +346,23 @@ func (s *Server) readAt(e *export, path string, off uint64, count int, res *xdr.
 		return n, off+uint64(n) >= uint64(size), StatusOK
 	}
 
+	// Bounded: a file larger than the export's bound is not loaded whole to
+	// answer a request for a range of it (see WithMaxFallbackRead).
+	if limit := e.fallbackLimit(); limit >= 0 {
+		st, err := e.fs.Stat(path)
+		if err != nil {
+			return 0, false, statusFor(err, StatusIO)
+		}
+		if st.Size() > uint64(limit) {
+			return 0, false, StatusIO
+		}
+	}
 	data, err := e.fs.ReadFile(path)
 	if err != nil {
 		return 0, false, statusFor(err, StatusIO)
+	}
+	if limit := e.fallbackLimit(); limit >= 0 && int64(len(data)) > limit {
+		return 0, false, StatusIO // it grew between the Stat and the read
 	}
 	if off >= uint64(len(data)) {
 		res.Opaque(nil)

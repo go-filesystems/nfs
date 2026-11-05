@@ -74,6 +74,28 @@ func openerFor(fs any) Opener {
 	return o
 }
 
+// fallbackLimit is the largest file READ loads whole from a driver with no
+// OpenFile; negative means no bound.
+func (e *export) fallbackLimit() int64 {
+	switch {
+	case e.maxFallbackRead == 0:
+		return DefaultMaxFallbackRead
+	case e.maxFallbackRead < 0:
+		return -1
+	}
+	return e.maxFallbackRead
+}
+
+// OwnerReader is the optional capability a driver implements so that SETATTR of
+// only the uid or only the gid can leave the other one alone: the
+// [github.com/go-filesystems/interface.MetadataSetter] Chown takes both values,
+// and this server cannot know the one the client did not send. Without it, a
+// SETATTR that sets one of them answers NFS3ERR_NOTSUPP rather than setting
+// the other to 0.
+type OwnerReader interface {
+	Owner(path string) (uid, gid uint32, err error)
+}
+
 // openFile opens path through the driver's Opener, rejecting the (nil, nil)
 // return rather than dereferencing it.
 //

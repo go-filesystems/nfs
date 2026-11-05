@@ -160,7 +160,16 @@ server, and both are measured rather than assumed:
 offset the client asked for. A driver *without* it is read through `ReadFile`,
 which materialises the **entire file** for every READ — so streaming a 4 GiB
 image in 1 MiB reads costs 4096 full-file reads. Correct, but only usable
-for small files.
+for small files, so **since v0.10.0 it is bounded**: a file larger than 64 MiB
+(`WithMaxFallbackRead(n)` changes it, a negative `n` lifts it) is not loaded to
+answer a READ of a few bytes; the READ answers `NFS3ERR_IO`. The remedy is for
+the driver to implement `OpenFile`.
+
+**Ownership.** `SETATTR` of the uid alone or the gid alone (a field not sent is
+not changed, RFC 1813 3.3.2) needs the other one: a driver implementing
+`OwnerReader` (`Owner(path) (uid, gid, err)`) lets the server keep it; without
+it the change answers `NFS3ERR_NOTSUPP` rather than setting the other to 0
+(before v0.10.0 it did, silently).
 
 **Transfer size.** FSINFO offers 1 MiB for `rtmax`/`wtmax` (since v0.8.0;
 128 KiB before), which is the Linux client's default `rsize`/`wsize`: one
