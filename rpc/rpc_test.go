@@ -526,4 +526,5 @@ func (h *halfConn) Close() error                { return nil }
 func (h *halfConn) RemoteAddr() net.Addr        { return nil }
 
 func (h *halfConn) SetDeadline(time.Time) error      { return nil }
+func (h *halfConn) SetReadDeadline(time.Time) error  { return nil }
 func (h *halfConn) SetWriteDeadline(time.Time) error { return nil }

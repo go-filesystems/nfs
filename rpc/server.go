@@ -12,8 +12,10 @@ import (
 	"runtime/debug"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/go-filesystems/inflight"
 	"github.com/go-filesystems/nfs/xdr"
 )
 
@@ -86,6 +88,15 @@ type Program struct {
 	// answered PROC_UNAVAIL, which is what a client needs to hear to fall
 	// back rather than hang.
 	Procs map[uint32]Proc
+	// Ranges says, for a procedure whose calls may run beside others, what
+	// part of which file a call touches (a READ or a WRITE, to the NFS layer).
+	// It is given a COPY of the decoder positioned at the procedure's
+	// arguments, so reading them costs the procedure nothing, and reports
+	// false for a call it cannot make sense of, which then runs alone and
+	// fails in order. Two calls on one key whose ranges overlap, a write among
+	// them, run in arrival order; every procedure with no entry runs alone,
+	// after everything before it has been answered.
+	Ranges map[uint32]func(args xdr.Decoder) (inflight.Span, bool)
 }
 
 // maxRecordDefault caps one RPC record. NFSv3 WRITE is the only procedure
@@ -111,6 +122,19 @@ const (
 	// Linux nconnect option at most 16), so this is room for hundreds of
 	// clients while refusing the thousands of sockets a flood would open.
 	DefaultMaxConns = 1024
+	// DefaultMaxInFlight is how many calls one connection may have in progress
+	// at once. The Linux client keeps a slot table per transport that grows to
+	// 65536 entries at most and in practice a few dozen are busy.
+	DefaultMaxInFlight = 32
+	// DefaultMaxInFlightTotal is the ceiling across ALL connections: each call
+	// in flight holds up to a record in (a WRITE, 1 MiB) and a reply out (a
+	// READ, 1 MiB), so this bounds memory at about 256 MiB however many
+	// connections there are.
+	DefaultMaxInFlightTotal = 128
+	// DefaultRecordTimeout bounds how long the rest of a record may take to
+	// arrive once its first byte has: the call holds a slot and a token of the
+	// server-wide budget meanwhile.
+	DefaultRecordTimeout = 30 * time.Second
 )
 
 // readChunk is the least a record buffer grows by at a time. The buffer never
@@ -130,15 +154,18 @@ var errRecordTooLarge = errors.New("rpc: record too large")
 
 // Server dispatches RPC calls arriving on a TCP listener.
 //
-// Calls on one connection are handled one at a time, in arrival order.
-// Clients pipeline aggressively — the Linux client will have a dozen RPCs
-// outstanding on a single connection — so this serialises them. That is not
-// a shortcut: a [github.com/go-filesystems/interface.Filesystem] is backed by
-// one *os.File with one seek offset and is not documented as safe for
-// concurrent use, so overlapping two READs would interleave seeks and return
-// each other's bytes. Correct and ordered beats fast and wrong; a driver that
-// later documents concurrency-safety can be given a parallel dispatcher
-// without a protocol change.
+// Calls on one connection are decoded one at a time, in arrival order, and a
+// procedure that declares what it touches ([Program.Ranges]) then runs beside
+// the others, up to [Server.MaxInFlight] per connection and
+// [Server.MaxInFlightTotal] across the server (both taken before the record is
+// read). Replies leave as they are ready: an ONC RPC client matches a reply to
+// its call by xid (RFC 5531), as the Linux client does with the dozens of calls
+// it keeps outstanding on a transport. A call that declares nothing is a
+// barrier: it waits for every earlier call to be answered and runs alone, which
+// is what keeps a [github.com/go-filesystems/interface.Filesystem], whose
+// calls are documented as safe beside each other only for ReadAt, correct.
+// The mechanism is [github.com/go-filesystems/inflight]; MaxInFlight -1 is the
+// one-call-at-a-time server of v0.10 and before.
 type Server struct {
 	// MaxRecord caps one RPC record in bytes. Zero means maxRecordDefault.
 	MaxRecord int
@@ -204,6 +231,29 @@ type Server struct {
 	// Set it before Serve.
 	MaxConns int
 
+	// MaxInFlight is how many calls one connection may have in progress at
+	// once. Zero means [DefaultMaxInFlight]; a negative value means 1, the
+	// one-call-at-a-time behaviour of v0.10 and before.
+	//
+	// Set it before Serve.
+	MaxInFlight int
+
+	// MaxInFlightTotal caps the calls in progress across every connection.
+	// Zero or less means [DefaultMaxInFlightTotal]. A call takes its share
+	// before its record is read and gives it back when its reply is written,
+	// so a client that does not read its replies keeps its calls counted, as
+	// it would keep a knfsd thread: close stalled connections (IdleTimeout).
+	//
+	// Set it before Serve.
+	MaxInFlightTotal int
+
+	// RecordTimeout bounds how long the rest of a record may take once its
+	// first byte has arrived. Zero means [DefaultRecordTimeout]; a negative
+	// value disables it.
+	//
+	// Set it before Serve.
+	RecordTimeout time.Duration
+
 	// ErrorLog receives what the server cannot report to a client — a
 	// procedure that panicked, for one. Nil means the log package's
 	// standard logger.
@@ -217,6 +267,33 @@ type Server struct {
 	ln       net.Listener
 	closed   bool
 	wg       sync.WaitGroup
+	pool     *inflight.Pool // made by the first connection, from MaxInFlightTotal
+}
+
+// inflightPool returns the server-wide budget and range set, made on first use
+// so that the fields above can be set any time before Serve.
+func (s *Server) inflightPool() *inflight.Pool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pool == nil {
+		n := s.MaxInFlightTotal
+		if n <= 0 {
+			n = DefaultMaxInFlightTotal
+		}
+		s.pool, _ = inflight.NewPool(n) // n is at least 1
+	}
+	return s.pool
+}
+
+// maxInFlight resolves [Server.MaxInFlight].
+func (s *Server) maxInFlight() int {
+	switch {
+	case s.MaxInFlight == 0:
+		return DefaultMaxInFlight
+	case s.MaxInFlight < 0:
+		return 1
+	}
+	return s.MaxInFlight
 }
 
 // key packs a program/version pair.
@@ -339,6 +416,7 @@ func (s *Server) serveConn(raw net.Conn) {
 	// REPLACES it — closing or deleting the wrapper instead would leave the
 	// entry in the table for a connection nobody can close.
 	c := raw
+	var cn *inflight.Conn
 	defer func() {
 		// A panic outside a procedure — in an Authenticator, say — costs
 		// this connection and nothing more. The one inside a procedure is
@@ -346,71 +424,205 @@ func (s *Server) serveConn(raw net.Conn) {
 		if r := recover(); r != nil {
 			s.logf("rpc: panic serving %v: %v\n%s", raw.RemoteAddr(), r, debug.Stack())
 		}
+		if cn != nil {
+			// Requests still in flight finish (or fail on the closing stream)
+			// before the connection is forgotten.
+			cn.Wait()
+		}
 		raw.Close()
 		s.mu.Lock()
 		delete(s.conns, raw)
 		s.mu.Unlock()
 	}()
 
-	// small is what the connection keeps between calls, while it waits for
-	// the next record. A call that needs more borrows it (see borrow) and
-	// gives it back once its reply is out: a connection doing nothing holds
-	// no large buffer, however large its last call was.
-	small := make([]byte, 0, smallBuffer)
-	var req []byte
 	var state *tls.ConnectionState
 	// peer is the identity the TLS client certificate carries. It is a local
 	// of THIS goroutine on purpose: nothing another connection runs can read
 	// or overwrite it, so a principal cannot leak from one client to another.
 	var peer string
 	idle := timeoutOr(s.IdleTimeout, DefaultIdleTimeout)
+	record := timeoutOr(s.RecordTimeout, DefaultRecordTimeout)
+	if idle > 0 && (record == 0 || idle < record) {
+		// The whole record arrives within one IdleTimeout at the most, as it
+		// always has.
+		record = idle
+	}
+	w := &connWriter{c: c, raw: raw, idle: idle}
+	// The error is impossible: the writer is not nil, the order is one of the
+	// two, and the width is at least 1.
+	cn, _ = s.inflightPool().NewConn(w, inflight.AnyOrder, s.maxInFlight())
+	var active atomic.Int32 // calls handed to cn and not yet run
+	pr := &prefixed{}
 	for {
-		var err error
-		if idle > 0 {
-			// A deadline error is an ordinary read error: the loop returns
-			// and the connection goes.
-			_ = c.SetDeadline(time.Now().Add(idle))
+		if cn.Err() != nil {
+			return
 		}
-		req, err = s.readRecord(c, small[:0])
+		// Wait for the next record to begin BEFORE taking a slot and a token:
+		// a connection with nothing to say holds nothing of the server's
+		// budget. A timeout while calls are still being worked on is not an
+		// idle connection (the client is waiting for them), so it is retried.
+		first, err := awaitRecord(c, idle, &active)
 		if err != nil {
 			return
 		}
-		var startTLS bool
+		sl, err := cn.Begin()
+		if err != nil {
+			return
+		}
+		if record > 0 {
+			// The slot and the token are held while the rest of the record
+			// arrives, so the time that takes is bounded on its own, shorter
+			// than the idle time: a client that trickles bytes must not be
+			// able to hold the server-wide budget for minutes.
+			_ = c.SetReadDeadline(time.Now().Add(record))
+		}
+		pr.reset(c, first)
+		// small is what a slot keeps between calls. A call that needs more
+		// borrows it (see borrow) and gives it back once it is done: a
+		// connection doing nothing holds no large buffer, however large its
+		// last call was.
+		if sl.In == nil {
+			sl.In = make([]byte, 0, smallBuffer)
+		}
+		req, err := s.readRecord(pr, sl.In[:0])
+		if err != nil {
+			cn.Abandon(sl)
+			return
+		}
 		// The reply starts after room for its record mark: see writeRecord.
 		res := borrow(markLen)
 		if res == nil {
-			res = make([]byte, 0, smallBuffer)
+			if cap(sl.Out) < smallBuffer {
+				sl.Out = make([]byte, 0, smallBuffer)
+			}
+			res = sl.Out[:0]
 		}
-		res, startTLS, err = s.handle(req, res[:markLen], c.RemoteAddr(), state, peer)
-		giveBack(req)
+		var later deferred
+		reply, startTLS, err := s.handleUpTo(req, res[:markLen], c.RemoteAddr(), state, peer, &later)
 		if err != nil {
 			// Nothing sensible can be replied to a message that is not
 			// even a call, so the connection goes.
+			giveBack(req)
+			cn.Abandon(sl)
 			return
 		}
-		if idle > 0 {
-			// Re-armed for the reply: the procedure's own time must not eat
-			// into the time the client is given to read it.
-			_ = c.SetWriteDeadline(time.Now().Add(idle))
-		}
-		err = writeRecord(c, res)
-		giveBack(res)
-		if err != nil {
-			return
+		active.Add(1)
+		switch {
+		case later.run == nil:
+			// Answered without a procedure (a refusal, a probe, a context
+			// establishment): in order, alone.
+			giveBack(req)
+			cn.Barrier(sl, func(*inflight.Slot) ([]byte, error) {
+				defer active.Add(-1)
+				setMark(reply)
+				return reply, nil
+			})
+		case later.ranged:
+			cn.Go(sl, later.span, s.runner(later.run, req, &active))
+		default:
+			cn.Barrier(sl, s.runner(later.run, req, &active))
 		}
 		if startTLS {
-			// The reply saying STARTTLS has gone out; RFC 9289 §5.1 has the
-			// client send its ClientHello on THIS connection next. Replacing
-			// c means every later read and write goes through TLS, including
-			// the record framing.
+			// The reply saying STARTTLS must be out before anything else
+			// happens; RFC 9289 §5.1 has the client send its ClientHello on
+			// THIS connection next. Replacing c means every later read and
+			// write goes through TLS, including the record framing. Nothing is
+			// in flight, so nothing reads w.c while it is replaced.
+			cn.Wait()
 			upgraded, st, err := upgrade(c, s.TLS, timeoutOr(s.HandshakeTimeout, DefaultHandshakeTimeout))
 			if err != nil {
 				return
 			}
-			c, state = upgraded, st
+			c, state, w.c = upgraded, st, upgraded
 			peer = s.certPrincipal(st)
 		}
 	}
+}
+
+// runner is the work of one call as inflight runs it: the procedure, then the
+// record mark. A panic outside the procedure itself (invoke has answered that
+// one) ends the connection and not the process.
+func (s *Server) runner(run func() []byte, req []byte, active *atomic.Int32) inflight.Run {
+	return func(*inflight.Slot) (out []byte, err error) {
+		defer active.Add(-1)
+		defer func() {
+			if r := recover(); r != nil {
+				s.logf("rpc: panic answering a call: %v\n%s", r, debug.Stack())
+				out, err = nil, errPanic
+			}
+		}()
+		out = run()
+		giveBack(req)
+		setMark(out)
+		return out, nil
+	}
+}
+
+var errPanic = errors.New("rpc: panic answering a call")
+
+// connWriter writes one reply per Write, with its own deadline, and gives the
+// reply's buffer back. A failed write closes the connection, which is what
+// wakes the reader that is waiting for the next record.
+type connWriter struct {
+	c, raw net.Conn
+	idle   time.Duration
+}
+
+func (w *connWriter) Write(p []byte) (int, error) {
+	if w.idle > 0 {
+		// Re-armed for each reply: the procedure's own time must not eat into
+		// the time the client is given to read it.
+		_ = w.c.SetWriteDeadline(time.Now().Add(w.idle))
+	}
+	n, err := w.c.Write(p)
+	giveBack(p)
+	if err != nil {
+		w.raw.Close()
+	}
+	return n, err
+}
+
+// awaitRecord waits for the first byte of the next record, and returns it.
+func awaitRecord(c net.Conn, idle time.Duration, active *atomic.Int32) (byte, error) {
+	var b [1]byte
+	for {
+		if idle > 0 {
+			// A deadline error is an ordinary read error: the loop returns
+			// and the connection goes, unless calls are still in progress.
+			_ = c.SetReadDeadline(time.Now().Add(idle))
+		}
+		n, err := c.Read(b[:])
+		if n == 1 {
+			return b[0], nil
+		}
+		var ne net.Error
+		if err == nil || (errors.As(err, &ne) && ne.Timeout() && active.Load() > 0) {
+			continue
+		}
+		return 0, err
+	}
+}
+
+// prefixed is a reader that hands out one byte already taken from r first.
+type prefixed struct {
+	r    io.Reader
+	b    byte
+	have bool
+}
+
+func (p *prefixed) reset(r io.Reader, b byte) { p.r, p.b, p.have = r, b, true }
+
+func (p *prefixed) Read(b []byte) (int, error) {
+	if p.have && len(b) > 0 {
+		b[0], p.have = p.b, false
+		return 1, nil
+	}
+	return p.r.Read(b)
+}
+
+// setMark fills the record mark in front of a reply: see writeRecord.
+func setMark(rec []byte) {
+	binary.BigEndian.PutUint32(rec, lastFragment|uint32(len(rec)-markLen))
 }
 
 // timeoutOr resolves a timeout field: zero means the default, a negative
@@ -581,6 +793,13 @@ func writeRecord(w io.Writer, rec []byte) error {
 //
 // peer is the identity of the connection's TLS client certificate, or empty.
 func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionState, peer string) ([]byte, bool, error) {
+	return s.handleUpTo(req, res, remote, state, peer, nil)
+}
+
+// handleUpTo is handle, except that when later is not nil and the call reaches
+// a procedure, it returns (nil, false, nil) with the procedure's work left in
+// later instead of running it.
+func (s *Server) handleUpTo(req, res []byte, remote net.Addr, state *tls.ConnectionState, peer string, later *deferred) ([]byte, bool, error) {
 	d := xdr.NewDecoder(req)
 	e := xdr.AppendEncoder(res)
 	base := len(res)
@@ -675,6 +894,34 @@ func (s *Server) handle(req, res []byte, remote net.Addr, state *tls.ConnectionS
 
 	encodeAccepted(e, h.xid, stSuccess, verf)
 	results := e.Len()
+	if later != nil {
+		// Everything above ran in the connection's reader, in arrival order:
+		// decoding, authentication (an Authenticator keeps per-context state
+		// that has to see calls in order) and lookup. What is left is the
+		// procedure itself, which the caller may run beside others.
+		if r := prog.Ranges[h.proc]; r != nil {
+			later.span, later.ranged = r(*d)
+		}
+		later.run = func() []byte {
+			out, _, _ := s.execute(proc, h, principal, d, e, remote, state, verf, wrap, base, results)
+			return out
+		}
+		return nil, false, nil
+	}
+	return s.execute(proc, h, principal, d, e, remote, state, verf, wrap, base, results)
+}
+
+// deferred is what handle leaves for the caller when asked to stop short of
+// running the procedure: the work, and what part of which file it touches.
+type deferred struct {
+	run    func() []byte
+	span   inflight.Span
+	ranged bool // span says what the call touches; false for a call that may touch anything
+}
+
+// execute runs the procedure and finishes the reply.
+func (s *Server) execute(proc Proc, h callHeader, principal string, d *xdr.Decoder, e *xdr.Encoder,
+	remote net.Addr, state *tls.ConnectionState, verf Auth, wrap func([]byte) []byte, base, results int) ([]byte, bool, error) {
 	st := s.invoke(proc, &Call{
 		XID: h.xid, Prog: h.prog, Vers: h.vers, Proc: h.proc,
 		Cred: h.cred, Principal: principal, Args: d, Res: e, Remote: remote,

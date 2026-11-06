@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"io"
 
+	"github.com/go-filesystems/inflight"
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/nfs/rpc"
 	"github.com/go-filesystems/nfs/xdr"
@@ -25,6 +26,25 @@ const (
 	writeMax = 1 << 20
 	dirPref  = 1 << 15 // 32 KiB, the preferred READDIR reply size
 )
+
+// readRange is what a READ touches, read from a copy of its arguments
+// (fhandle3, offset, count): the handle names the file, so two handles to one
+// file order together.
+func readRange(args xdr.Decoder) (inflight.Span, bool) {
+	h, err := args.Opaque()
+	if err != nil {
+		return inflight.Span{}, false
+	}
+	off, err := args.Uint64()
+	if err != nil {
+		return inflight.Span{}, false
+	}
+	count, err := args.Uint32()
+	if err != nil {
+		return inflight.Span{}, false
+	}
+	return inflight.ReadRange(string(h), off, uint64(min(count, readMax))), true
+}
 
 // nfsProgram builds the NFSv3 program table.
 func (s *Server) nfsProgram() *rpc.Program {
@@ -54,6 +74,13 @@ func (s *Server) nfsProgram() *rpc.Program {
 			procFsinfo:      s.procFsinfo,
 			procPathconf:    s.procPathconf,
 			procCommit:      s.procCommit,
+		},
+		// READ runs beside other READs (and beside nothing that writes the
+		// same bytes). Every other procedure is answered alone, after
+		// everything before it: a WRITE opens its own File each time, and the
+		// driver contract covers concurrent WriteAt only on one File.
+		Ranges: map[uint32]func(xdr.Decoder) (inflight.Span, bool){
+			procRead: readRange,
 		},
 	}
 }
@@ -333,6 +360,16 @@ func (s *Server) readAt(e *export, path string, off uint64, count int, res *xdr.
 			count = int(remaining)
 		}
 		n, err := res.OpaqueFrom(count, func(buf []byte) (int, error) {
+			// ReadAt is the one driver call documented as safe beside
+			// others (interface v0.5.0, File), so it alone lets go of the
+			// exclusive lock: the open above and the Close below, which the
+			// contract says nothing about, do not.
+			s.fsmu.Unlock()
+			s.fsmu.LockIO()
+			defer func() {
+				s.fsmu.UnlockIO()
+				s.fsmu.Lock()
+			}()
 			n, err := f.ReadAt(buf, int64(off))
 			// io.ReaderAt is allowed to return io.EOF together with a full read.
 			if err != nil && !(errors.Is(err, io.EOF) && n == len(buf)) {

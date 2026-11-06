@@ -165,6 +165,22 @@ for small files, so **since v0.10.0 it is bounded**: a file larger than 64 MiB
 answer a READ of a few bytes; the READ answers `NFS3ERR_IO`. The remedy is for
 the driver to implement `OpenFile`.
 
+**Concurrent calls.** Since v0.11.0 a connection answers up to 32 calls at once
+(`ConnLimits.MaxInFlight`, -1 restores the one-at-a-time server), with a
+server-wide ceiling of 128 (`MaxInFlightTotal`) that a call takes before its
+record is read and returns when its reply is written, so an idle connection
+holds nothing and a client that never reads its replies keeps its calls
+counted (close it: `IdleTimeout`). Replies leave as they are ready and are
+matched by xid (RFC 5531), which is how the Linux client keeps its slot table
+busy. READ runs beside other READs, through the driver's `ReadAt` under a
+shared filesystem lock; every other procedure is a barrier that waits for the
+calls before it and runs alone. WRITE is one of them on purpose: it opens its
+own `File` for each call, and `interface` documents concurrent `WriteAt` only
+on one `File`. The rest of a record has `RecordTimeout` (30 s) to arrive once
+its first byte has, since the call holds its share of the budget meanwhile.
+The mechanism is [go-filesystems/inflight](https://github.com/go-filesystems/inflight),
+shared with the SFTP and SMB servers.
+
 **Ownership.** `SETATTR` of the uid alone or the gid alone (a field not sent is
 not changed, RFC 1813 3.3.2) needs the other one: a driver implementing
 `OwnerReader` (`Owner(path) (uid, gid, err)`) lets the server keep it; without
