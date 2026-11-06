@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/go-filesystems/inflight v0.1.0 // indirect
 	github.com/go-volumes/gpt v0.3.0 // indirect
 	github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b // indirect
 	github.com/hashicorp/go-uuid v1.0.4 // indirect

@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/go-filesystems/inflight v0.1.0 // indirect
 	github.com/hashicorp/go-uuid v1.0.4 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect

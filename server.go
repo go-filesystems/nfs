@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-filesystems/inflight"
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/nfs/rpc"
 )
@@ -72,14 +73,18 @@ type Server struct {
 	// until a driver can report real ones. See [attrFor].
 	start uint32
 
-	// fsmu serialises *all* access to every exported filesystem.
+	// fsmu is the filesystem lock, and the driver contract made executable.
 	//
-	// A go-filesystems driver wraps a single *os.File and is not documented
-	// as safe for concurrent use; two overlapping READs would interleave
-	// seeks and hand each caller the other's bytes. NFS clients pipeline
-	// heavily, so this is not a theoretical race — it is the first thing a
-	// parallel `ls -lR` would hit.
-	fsmu sync.Mutex
+	// The interface module documents exactly two things as safe for
+	// concurrent use: File.ReadAt, and WritableFile.WriteAt on non-overlapping
+	// ranges (interface v0.5.0). Everything else a driver does -- path calls,
+	// Open, Size, Sync, Close -- is not, and two of them overlapping would
+	// interleave seeks and hand each caller the other's bytes. So Lock() is
+	// still the rule, and holds off everything; the one exception is the
+	// ReadAt of a READ and the WriteAt of a WRITE, which hold it shared
+	// (LockIO), with [github.com/go-filesystems/inflight]'s ranges keeping
+	// overlapping ones apart.
+	fsmu *inflight.FSLock
 
 	mu      sync.Mutex
 	byPath  map[string]*export
@@ -151,6 +156,7 @@ func New() (*Server, error) {
 	}
 	s := &Server{
 		handles: h,
+		fsmu:    inflight.NewFSLock(false),
 		start:   uint32(time.Now().Unix()),
 		byPath:  make(map[string]*export),
 		byID:    make(map[uint64]*export),
@@ -499,6 +505,18 @@ type ConnLimits struct {
 	// MaxConns caps concurrent connections; one past the cap is closed as
 	// soon as it is accepted. Default [rpc.DefaultMaxConns] (1024).
 	MaxConns int
+	// MaxInFlight is how many RPC calls one connection may have in progress
+	// at once. Default [rpc.DefaultMaxInFlight] (32); a negative value means
+	// 1, the one-call-at-a-time behaviour of v0.10 and before.
+	MaxInFlight int
+	// MaxInFlightTotal caps the calls in progress across ALL connections.
+	// Default [rpc.DefaultMaxInFlightTotal] (128). A call takes its share
+	// before its record is read and gives it back when its reply is written.
+	MaxInFlightTotal int
+	// RecordTimeout bounds how long the rest of a record may take once its
+	// first byte has arrived, the time a call holds its share of the budget
+	// while it is being received. Default [rpc.DefaultRecordTimeout] (30 s).
+	RecordTimeout time.Duration
 }
 
 // SetConnLimits replaces the connection limits. Every server has them —
@@ -516,6 +534,9 @@ func (s *Server) SetConnLimits(l ConnLimits) error {
 	s.rpcsrv.IdleTimeout = l.IdleTimeout
 	s.rpcsrv.HandshakeTimeout = l.HandshakeTimeout
 	s.rpcsrv.MaxConns = l.MaxConns
+	s.rpcsrv.MaxInFlight = l.MaxInFlight
+	s.rpcsrv.MaxInFlightTotal = l.MaxInFlightTotal
+	s.rpcsrv.RecordTimeout = l.RecordTimeout
 	return nil
 }
 
