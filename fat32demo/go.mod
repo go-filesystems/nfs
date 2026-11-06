@@ -4,9 +4,9 @@ go 1.27.3
 
 require (
 	github.com/go-authn/krb5 v0.3.3
-	github.com/go-filesystems/fat32 v0.10.0
+	github.com/go-filesystems/fat32 v0.11.0
 	github.com/go-filesystems/interface v0.5.0
-	github.com/go-filesystems/nfs v0.9.0
+	github.com/go-filesystems/nfs v0.11.1
 	github.com/jcmturner/gokrb5/v8 v8.4.4
 )
 
