@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -368,6 +369,42 @@ func TestFailureWhileIdleEndsTheConnectionAtTheNextRecord(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the connection outlived a failed reply")
+	}
+}
+
+// A record too big for the buffer it is read into moves into a lent one when
+// one is big enough. Deterministic here; elsewhere it depends on what the
+// pool happens to hold (and sync.Pool drops puts at random under -race), which
+// is what made the coverage of readRecord vary by architecture.
+func TestReadRecordMovesIntoALentBuffer(t *testing.T) {
+	for borrow(1) != nil { // empty the pool other tests filled
+	}
+	payload := bytes.Repeat([]byte{7}, 20000)
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], lastFragment|uint32(len(payload)))
+	s := &Server{}
+	for range 200 { // a dropped put just means another round
+		giveBack(make([]byte, 0, 64<<10))
+		var rec bytes.Buffer
+		rec.Write(hdr[:])
+		rec.Write(payload)
+		got, err := s.readRecord(&rec, make([]byte, 0, smallBuffer))
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("readRecord = %d bytes, %v", len(got), err)
+		}
+		if cap(got) == 64<<10 {
+			return
+		}
+	}
+	t.Fatal("the record never moved into a lent buffer")
+}
+
+// The connection loop now waits for a record's first byte itself, so a record
+// header that ends early is only met inside readRecord.
+func TestReadRecordRefusesAShortHeader(t *testing.T) {
+	s := &Server{}
+	if _, err := s.readRecord(bytes.NewReader([]byte{0x80, 0}), nil); err == nil {
+		t.Fatal("a 2-byte record header was accepted")
 	}
 }
 
