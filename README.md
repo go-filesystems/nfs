@@ -172,9 +172,12 @@ record is read and returns when its reply is written, so an idle connection
 holds nothing and a client that never reads its replies keeps its calls
 counted (close it: `IdleTimeout`). Replies leave as they are ready and are
 matched by xid (RFC 5531), which is how the Linux client keeps its slot table
-busy. READ runs beside other READs, through the driver's `ReadAt` under a
-shared filesystem lock; every other procedure is a barrier that waits for the
-calls before it and runs alone. WRITE is one of them on purpose: it opens its
+busy. READ calls are answered beside each other; with `WithConcurrentReads()`
+on the export the driver's `ReadAt` of each also runs under a shared filesystem
+lock (off by default: measured on a host directory, where `ReadAt` is one
+pread, the three lock transitions cost 25% over 4 and 8 connections; it pays
+for a driver whose `ReadAt` is expensive). Every other procedure is a barrier
+that waits for the calls before it and runs alone. WRITE is one of them on purpose: it opens its
 own `File` for each call, and `interface` documents concurrent `WriteAt` only
 on one `File`. The rest of a record has `RecordTimeout` (30 s) to arrive once
 its first byte has, since the call holds its share of the budget meanwhile.

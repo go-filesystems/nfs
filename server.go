@@ -49,6 +49,9 @@ type export struct {
 	// maxFallbackRead bounds the size of a file READ may load whole through
 	// ReadFile (a driver with no OpenFile). See [WithMaxFallbackRead].
 	maxFallbackRead int64
+	// concurrentReads lets the ReadAt of a READ run under the shared lock.
+	// See [WithConcurrentReads].
+	concurrentReads bool
 	// total and avail feed FSSTAT. Zero means "unknown"; see [WithCapacity].
 	total, avail uint64
 	// capacity, when set, is asked at every FSSTAT instead; see
@@ -114,6 +117,19 @@ const DefaultMaxFallbackRead = 64 << 20
 // bound. The remedy for a large file is for the driver to implement OpenFile.
 func WithMaxFallbackRead(n int64) ExportOption {
 	return func(e *export) { e.maxFallbackRead = n }
+}
+
+// WithConcurrentReads lets the ReadAt of every READ on this export run beside
+// other READs' (and other connections'), under a shared filesystem lock;
+// everything else a READ does with the driver (stat, open, size, close) still
+// holds it exclusively, as the interface documents only ReadAt as safe beside
+// others. It pays when ReadAt is expensive (a driver that decodes an image),
+// and costs when it is one pread: on a host directory it measured 25% slower
+// over 4 and 8 connections, because the lock is taken three times instead of
+// once. Off by default for that reason. READ calls of one connection are
+// answered beside each other either way; this is about the driver.
+func WithConcurrentReads() ExportOption {
+	return func(e *export) { e.concurrentReads = true }
 }
 
 // WithCapacity sets the total and available byte counts reported by FSSTAT
