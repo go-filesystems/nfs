@@ -69,14 +69,16 @@ func TestPipelinedReadsAreMatchedByXID(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		fsys func() filesystem.Filesystem
+		opts []nfs.ExportOption
 	}{
-		{"ranged driver", func() filesystem.Filesystem { return &openFS{memFS: fixture()} }},
-		{"whole-file driver", func() filesystem.Filesystem { return fixture() }},
+		{"ranged driver, shared ReadAt", func() filesystem.Filesystem { return &openFS{memFS: fixture()} }, []nfs.ExportOption{nfs.WithConcurrentReads()}},
+		{"ranged driver, exclusive", func() filesystem.Filesystem { return &openFS{memFS: fixture()} }, nil},
+		{"whole-file driver", func() filesystem.Filesystem { return fixture() }, []nfs.ExportOption{nfs.WithConcurrentReads()}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want, _ := fixture().ReadFile("/dir/nested.bin")
 			addr := serve(t, func(s *nfs.Server) {
-				if err := s.Export("/", tc.fsys()); err != nil {
+				if err := s.Export("/", tc.fsys(), tc.opts...); err != nil {
 					t.Fatal(err)
 				}
 			})
@@ -127,7 +129,7 @@ func TestPipelinedReadsAreMatchedByXID(t *testing.T) {
 func TestConnectionsReadWhileAnotherWrites(t *testing.T) {
 	fsys := &openFS{memFS: fixture(), writable: true}
 	addr := serve(t, func(s *nfs.Server) {
-		if err := s.Export("/", fsys, nfs.ReadWrite()); err != nil {
+		if err := s.Export("/", fsys, nfs.ReadWrite(), nfs.WithConcurrentReads()); err != nil {
 			t.Fatal(err)
 		}
 	})

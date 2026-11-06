@@ -363,13 +363,19 @@ func (s *Server) readAt(e *export, path string, off uint64, count int, res *xdr.
 			// ReadAt is the one driver call documented as safe beside
 			// others (interface v0.5.0, File), so it alone lets go of the
 			// exclusive lock: the open above and the Close below, which the
-			// contract says nothing about, do not.
-			s.fsmu.Unlock()
-			s.fsmu.LockIO()
-			defer func() {
-				s.fsmu.UnlockIO()
-				s.fsmu.Lock()
-			}()
+			// contract says nothing about, do not. It is opt-in
+			// ([WithConcurrentReads]): measured on a host directory, where
+			// ReadAt is one pread, the three lock transitions cost 25% of
+			// throughput over 4 and 8 connections, and only a driver whose
+			// ReadAt is expensive gains from the overlap.
+			if e.concurrentReads {
+				s.fsmu.Unlock()
+				s.fsmu.LockIO()
+				defer func() {
+					s.fsmu.UnlockIO()
+					s.fsmu.Lock()
+				}()
+			}
 			n, err := f.ReadAt(buf, int64(off))
 			// io.ReaderAt is allowed to return io.EOF together with a full read.
 			if err != nil && !(errors.Is(err, io.EOF) && n == len(buf)) {
