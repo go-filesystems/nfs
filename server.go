@@ -52,6 +52,9 @@ type export struct {
 	// concurrentReads lets the ReadAt of a READ run under the shared lock.
 	// See [WithConcurrentReads].
 	concurrentReads bool
+	// pathOps makes a READ hold the lock shared from end to end. See
+	// [WithConcurrentPathOps].
+	pathOps bool
 	// total and avail feed FSSTAT. Zero means "unknown"; see [WithCapacity].
 	total, avail uint64
 	// capacity, when set, is asked at every FSSTAT instead; see
@@ -130,6 +133,28 @@ func WithMaxFallbackRead(n int64) ExportOption {
 // answered beside each other either way; this is about the driver.
 func WithConcurrentReads() ExportOption {
 	return func(e *export) { e.concurrentReads = true }
+}
+
+// WithConcurrentPathOps asserts that the driver of this export allows its
+// read-only path calls (Stat, OpenFile, File.Size, File.Close, ReadFile) to
+// run beside each other and beside File.ReadAt and WriteAt: true of a host
+// directory, false of a driver with a shared cursor or cache. The interface
+// documents only ReadAt and non-overlapping WriteAt as concurrent, so this
+// is the embedder's word, not something the server can check.
+//
+// With it a READ takes the filesystem lock ONCE, shared, around the attribute
+// lookup, the open, the ReadAt, the close and the post-op attributes: no
+// exclusive hand-over, so READs of any connection never wait for each other
+// and cost the same as under the exclusive lock when the data is cached. Every
+// mutating call (WRITE's path fallback, SETATTR, REMOVE, RENAME, ...) still
+// holds the lock exclusively and so never overlaps a READ; a positional WRITE
+// holds it shared, with its byte range kept apart from READs of the same file
+// by the dispatcher. It subsumes [WithConcurrentReads] on its export.
+//
+// The only exclusive step the old READ had was the driver contract, not a
+// server-side cache: the handle table has its own mutex.
+func WithConcurrentPathOps() ExportOption {
+	return func(e *export) { e.pathOps = true }
 }
 
 // WithCapacity sets the total and available byte counts reported by FSSTAT
