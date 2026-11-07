@@ -184,7 +184,9 @@ read-only path calls are safe beside each other (a host directory) says so with
 shared, around the attributes, the open, the `ReadAt`, the close and the
 post-op attributes; any call that changes something still takes it exclusively.
 `BenchmarkRead` (`BENCH_MODE=default|reads|pathops`) measures all three with a
-driver whose `ReadAt` costs 0, 100 µs or 1 ms. Every other procedure is a barrier
+driver whose `ReadAt` costs 0, 100 µs or 1 ms; `tools/benchrun` (its own module,
+outside the coverage gate) alternates test binaries round by round and refuses to
+time anything above a 1-minute load of 8. Every other procedure is a barrier
 that waits for the calls before it and runs alone. WRITE is one of them on purpose: it opens its
 own `File` for each call, and `interface` documents concurrent `WriteAt` only
 on one `File`. The rest of a record has `RecordTimeout` (30 s) to arrive once
