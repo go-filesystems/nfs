@@ -91,7 +91,9 @@ func TestAttrUsesTimesReader(t *testing.T) {
 	a.encode(e)
 	b := e.Bytes()
 	tail := b[len(b)-24:]
-	be := func(o int) uint32 { return uint32(tail[o])<<24 | uint32(tail[o+1])<<16 | uint32(tail[o+2])<<8 | uint32(tail[o+3]) }
+	be := func(o int) uint32 {
+		return uint32(tail[o])<<24 | uint32(tail[o+1])<<16 | uint32(tail[o+2])<<8 | uint32(tail[o+3])
+	}
 	if be(8) != 1234567890 || be(12) != 500 {
 		t.Errorf("encoded mtime = %d.%d", be(8), be(12))
 	}
