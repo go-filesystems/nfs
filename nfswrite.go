@@ -203,12 +203,12 @@ func (s *Server) procSetAttr(c *rpc.Call) rpc.Status {
 	if err != nil {
 		return rpc.StatusGarbageArgs
 	}
-	var guardCtime uint32
+	var guardCtime, guardCtimeNs uint32
 	if guard {
 		if guardCtime, err = c.Args.Uint32(); err != nil {
 			return rpc.StatusGarbageArgs
 		}
-		if _, err = c.Args.Uint32(); err != nil {
+		if guardCtimeNs, err = c.Args.Uint32(); err != nil {
 			return rpc.StatusGarbageArgs
 		}
 	}
@@ -229,7 +229,7 @@ func (s *Server) procSetAttr(c *rpc.Call) rpc.Status {
 	}
 	// The guard is the protocol's compare-and-set: apply only if nothing has
 	// changed the object since the client last looked.
-	if guard && guardCtime != before.ctime {
+	if guard && (guardCtime != before.ctime || guardCtimeNs != before.ctimeNs) {
 		wccFail(c.Res, StatusNotSync, before, StatusOK)
 		return rpc.StatusSuccess
 	}

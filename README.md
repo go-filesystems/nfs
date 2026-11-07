@@ -266,9 +266,13 @@ served -- a host directory, a resized quota -- passes
 [`WithCapacityFunc`](https://pkg.go.dev/github.com/go-filesystems/nfs#WithCapacityFunc)
 instead, which FSSTAT asks at every call.
 
-**Timestamps.** No driver reports an mtime, so every file currently carries
-the server's start time. This is visible in `ls -l` and is reported here
-rather than hidden; the fix is a timestamp accessor on `interface.Stat`.
+**Timestamps.** A driver with `filesystem.TimesReader` (interface v0.6.0)
+supplies atime, mtime and ctime, sent as nfstime3 with nanoseconds (RFC 1813
+§2.5.2); a time before 1970 is clamped to 0. fattr3 cannot say "absent" and
+has no birth time, so a time the format does not keep is the nearest honest
+bound: a missing atime or ctime is the mtime (FAT has no ctime), a missing
+mtime is the server's start time. A driver without the capability still
+carries the server's start time for every file, visible in `ls -l`.
 
 **Error taxonomy.** `interface` defines no sentinel errors, so drivers report
 "not found" however they like (`iso9660` has typed sentinels that do not wrap

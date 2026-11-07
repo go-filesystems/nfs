@@ -1,6 +1,8 @@
 package nfs
 
 import (
+	"math"
+
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-filesystems/nfs/xdr"
 )
@@ -19,6 +21,9 @@ type fattr struct {
 	atime  uint32
 	mtime  uint32
 	ctime  uint32
+	// The nanoseconds of each, nfstime3's second field. Zero where the
+	// filesystem keeps whole seconds.
+	atimeNs, mtimeNs, ctimeNs uint32
 }
 
 // ftypeOf maps the POSIX type bits of a driver's mode to an ftype3.
@@ -119,16 +124,62 @@ func (s *Server) attrFromStat(e *export, path string, st filesystem.Stat) (fattr
 		a.fileid = id
 	}
 
-	// Timestamps. No driver in the fleet reports one yet, so every file
-	// carries the server's start time. That is visibly wrong in `ls -l` and
-	// it is reported here rather than hidden: the fix is a timestamp
-	// accessor on interface.Stat, not a guess in this module. The probe
-	// below picks one up the day it exists.
+	// Timestamps. A driver with filesystem.TimesReader gives its own; a Stat
+	// with the older TimeStat probe gives one mtime; otherwise every file
+	// carries the server's start time, which is visibly wrong in `ls -l`.
+	tr, hasTimes := e.fs.(filesystem.TimesReader)
+	if hasTimes {
+		if ft, err := tr.Times(path); err == nil {
+			a.setTimes(ft, s.start)
+			return a, StatusOK
+		}
+	}
 	if t, ok := st.(TimeStat); ok {
 		m := uint32(t.ModTime())
 		a.atime, a.mtime, a.ctime = m, m, m
 	}
 	return a, StatusOK
+}
+
+// nfstime3 returns a Timestamp as nfstime3 (RFC 1813 §2.5.2: unsigned seconds
+// and nanoseconds since 1970-01-01 00:00:00 GMT). A time before 1970 has no
+// representation and is clamped to 0; one past 2106 to the largest.
+func nfstime3(ts filesystem.Timestamp) (sec, nsec uint32, ok bool) {
+	t, ok := ts.Get()
+	if !ok {
+		return 0, 0, false
+	}
+	u := t.Unix()
+	switch {
+	case u < 0:
+		return 0, 0, true
+	case u > math.MaxUint32:
+		return math.MaxUint32, 0, true
+	}
+	return uint32(u), uint32(t.Nanosecond()), true
+}
+
+// setTimes fills atime, mtime and ctime from what the filesystem records.
+//
+// fattr3 always carries all three: NFSv3 has no way to say "absent", and it has
+// no birth time, so Btime is not sent. Where a format keeps fewer, the missing
+// one is the nearest honest bound rather than 1970: a missing mtime is the
+// server's start time (the same fallback as a driver with no times at all), a
+// missing atime or ctime is the mtime. FAT has no ctime, for one: its last
+// content change is also a change of the file's attributes, so ctime = mtime
+// never claims an older change than the one it knows.
+func (a *fattr) setTimes(ft filesystem.FileTimes, start uint32) {
+	var ok bool
+	a.mtime, a.mtimeNs, ok = nfstime3(ft.Mtime)
+	if !ok {
+		a.mtime, a.mtimeNs = start, 0
+	}
+	if a.atime, a.atimeNs, ok = nfstime3(ft.Atime); !ok {
+		a.atime, a.atimeNs = a.mtime, a.mtimeNs
+	}
+	if a.ctime, a.ctimeNs, ok = nfstime3(ft.Ctime); !ok {
+		a.ctime, a.ctimeNs = a.mtime, a.mtimeNs
+	}
 }
 
 // encode writes a fattr3.
@@ -145,11 +196,11 @@ func (a fattr) encode(e *xdr.Encoder) {
 	e.Uint64(a.fsid)
 	e.Uint64(a.fileid)
 	e.Uint32(a.atime)
-	e.Uint32(0)
+	e.Uint32(a.atimeNs)
 	e.Uint32(a.mtime)
-	e.Uint32(0)
+	e.Uint32(a.mtimeNs)
 	e.Uint32(a.ctime)
-	e.Uint32(0)
+	e.Uint32(a.ctimeNs)
 }
 
 // encodePostOp writes a post_op_attr: a discriminated optional. Sending
@@ -172,9 +223,9 @@ func encodeWcc(e *xdr.Encoder, before fattr, beforeOK bool, after fattr, afterSt
 		e.Bool(true)
 		e.Uint64(before.size)
 		e.Uint32(before.mtime)
-		e.Uint32(0)
+		e.Uint32(before.mtimeNs)
 		e.Uint32(before.ctime)
-		e.Uint32(0)
+		e.Uint32(before.ctimeNs)
 	} else {
 		e.Bool(false)
 	}

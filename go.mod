@@ -4,12 +4,12 @@ go 1.27.3
 
 require (
 	github.com/go-authn/krb5 v0.3.3
-	github.com/go-filesystems/interface v0.5.0
+	github.com/go-filesystems/inflight v0.1.0
+	github.com/go-filesystems/interface v0.6.0
 	github.com/jcmturner/gokrb5/v8 v8.4.4
 )
 
 require (
-	github.com/go-filesystems/inflight v0.1.0 // indirect
 	github.com/hashicorp/go-uuid v1.0.4 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
