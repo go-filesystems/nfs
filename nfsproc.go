@@ -297,7 +297,18 @@ func (s *Server) procRead(c *rpc.Call) rpc.Status {
 	// data read straight into the reply's own buffer, with the count and eof
 	// in front of it filled in once the read has said what they are.
 	mark := c.Res.Len()
-	s.fsmu.Lock()
+	// One acquisition covers the attribute lookup, the open, the ReadAt, the
+	// close and the post-op attributes. On an export whose driver asserts that
+	// read-only path calls are safe beside each other
+	// ([WithConcurrentPathOps]) it is the shared one, so READs overlap and
+	// never wait for each other; otherwise the driver contract
+	// (interface v0.5.0) allows only the exclusive one, and readAt may trade it
+	// for the shared one around ReadAt alone ([WithConcurrentReads]).
+	if e.pathOps {
+		s.fsmu.LockIO()
+	} else {
+		s.fsmu.Lock()
+	}
 	a, aSt := s.attrFor(e, path)
 	if aSt != StatusOK {
 		st = aSt
@@ -319,7 +330,11 @@ func (s *Server) procRead(c *rpc.Call) rpc.Status {
 			}
 		}
 	}
-	s.fsmu.Unlock()
+	if e.pathOps {
+		s.fsmu.UnlockIO()
+	} else {
+		s.fsmu.Unlock()
+	}
 	if st != StatusOK {
 		c.Res.Truncate(mark)
 		c.Res.Uint32(uint32(st))
@@ -343,7 +358,8 @@ func (s *Server) procRead(c *rpc.Call) rpc.Status {
 // driver to implement OpenFile, not for this module to cache, because a cache
 // would have to guess when the underlying image changed.
 //
-// The caller must hold [Server.fsmu].
+// The caller must hold [Server.fsmu]: exclusively, or shared when the export
+// has [WithConcurrentPathOps].
 func (s *Server) readAt(e *export, path string, off uint64, count int, res *xdr.Encoder) (int, bool, Status) {
 	if e.open != nil {
 		f, err := e.openFile(path)
@@ -368,7 +384,7 @@ func (s *Server) readAt(e *export, path string, off uint64, count int, res *xdr.
 			// ReadAt is one pread, the three lock transitions cost 25% of
 			// throughput over 4 and 8 connections, and only a driver whose
 			// ReadAt is expensive gains from the overlap.
-			if e.concurrentReads {
+			if e.concurrentReads && !e.pathOps { // pathOps: already shared
 				s.fsmu.Unlock()
 				s.fsmu.LockIO()
 				defer func() {

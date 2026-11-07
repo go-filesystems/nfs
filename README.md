@@ -176,7 +176,17 @@ busy. READ calls are answered beside each other; with `WithConcurrentReads()`
 on the export the driver's `ReadAt` of each also runs under a shared filesystem
 lock (off by default: measured on a host directory, where `ReadAt` is one
 pread, the three lock transitions cost 25% over 4 and 8 connections; it pays
-for a driver whose `ReadAt` is expensive). Every other procedure is a barrier
+for a driver whose `ReadAt` is expensive). The exclusive lock around a READ's
+`Stat`, open and close is the driver contract, not a cache of the server:
+`interface` documents only `ReadAt` as safe beside other calls. A driver whose
+read-only path calls are safe beside each other (a host directory) says so with
+`WithConcurrentPathOps()`, and a READ of that export then takes the lock once,
+shared, around the attributes, the open, the `ReadAt`, the close and the
+post-op attributes; any call that changes something still takes it exclusively.
+`BenchmarkRead` (`BENCH_MODE=default|reads|pathops`) measures all three with a
+driver whose `ReadAt` costs 0, 100 µs or 1 ms; `tools/benchrun` (its own module,
+outside the coverage gate) alternates test binaries round by round and refuses to
+time anything above a 1-minute load of 8. Every other procedure is a barrier
 that waits for the calls before it and runs alone. WRITE is one of them on purpose: it opens its
 own `File` for each call, and `interface` documents concurrent `WriteAt` only
 on one `File`. The rest of a record has `RecordTimeout` (30 s) to arrive once

@@ -18,7 +18,7 @@ import (
 // discriminant, or a reply whose fields are in the wrong order — and those
 // are exactly the defects that make a real mount fail.
 type wire struct {
-	t    *testing.T
+	t    testing.TB
 	conn net.Conn
 	xid  uint32
 	// cred selects the credential flavour; AUTH_UNIX by default.
@@ -42,7 +42,7 @@ type reply struct {
 	body                   *xdr.Decoder
 }
 
-func dial(t *testing.T, addr string) *wire {
+func dial(t testing.TB, addr string) *wire {
 	t.Helper()
 	c, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -370,7 +370,7 @@ func (w *wire) readdirPlus(fh []byte, maxcount uint32) ([]dirEntry, nfs.Status) 
 }
 
 // serve starts a server on a loopback port and returns its address.
-func serve(t *testing.T, setup func(*nfs.Server)) string {
+func serve(t testing.TB, setup func(*nfs.Server)) string {
 	t.Helper()
 	s, err := nfs.New()
 	if err != nil {
