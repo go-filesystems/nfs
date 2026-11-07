@@ -147,9 +147,10 @@ func WithConcurrentReads() ExportOption {
 // exclusive hand-over, so READs of any connection never wait for each other
 // and cost the same as under the exclusive lock when the data is cached. Every
 // mutating call (WRITE's path fallback, SETATTR, REMOVE, RENAME, ...) still
-// holds the lock exclusively and so never overlaps a READ; a positional WRITE
-// holds it shared, with its byte range kept apart from READs of the same file
-// by the dispatcher. It subsumes [WithConcurrentReads] on its export.
+// holds the lock exclusively (or, for a positional WRITE's WriteAt, shared
+// with its range kept apart from READs by the dispatcher) and so never
+// overlaps a READ's driver calls. It subsumes [WithConcurrentReads] on its
+// export.
 //
 // The only exclusive step the old READ had was the driver contract, not a
 // server-side cache: the handle table has its own mutex.
