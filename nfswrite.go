@@ -27,6 +27,11 @@ func (s *Server) writeVerf() []byte {
 	return b[:]
 }
 
+// volumeSyncer is a Filesystem that can be asked to put everything it has
+// accepted on its backing store: (*hfsplus.Volume).Sync is one. WRITE and COMMIT
+// use it for a driver whose files have no Sync of their own.
+type volumeSyncer interface{ Sync() error }
+
 // sattr is a decoded sattr3 (RFC 1813 §2.5): every field optional.
 type sattr struct {
 	modeSet bool
@@ -276,7 +281,8 @@ func (s *Server) procWrite(c *rpc.Call) rpc.Status {
 	if _, err = c.Args.Uint32(); err != nil { // count, redundant with len(data)
 		return rpc.StatusGarbageArgs
 	}
-	if _, err = c.Args.Uint32(); err != nil { // stable
+	stable, err := c.Args.Uint32()
+	if err != nil {
 		return rpc.StatusGarbageArgs
 	}
 	data, err := c.Args.Opaque()
@@ -314,15 +320,30 @@ func (s *Server) procWrite(c *rpc.Call) rpc.Status {
 		wccFail(c.Res, StatusIsDir, before, StatusOK)
 		return rpc.StatusSuccess
 	}
-	if st := s.writeAt(e, path, off, data, os.FileMode(before.mode)); st != StatusOK {
+	st, whole := s.writeAt(e, path, off, data, os.FileMode(before.mode))
+	if st != StatusOK {
 		wccFail(c.Res, st, before, StatusOK)
 		return rpc.StatusSuccess
+	}
+	committed := writeFileSync
+	if vs, ok := e.fs.(volumeSyncer); ok && whole {
+		// A WriteFile through a driver that can also be synced (hfsplus at
+		// mounted or lazy durability) has not necessarily reached the medium.
+		// Stability the client asked for is honoured with a Sync; an UNSTABLE
+		// WRITE is answered UNSTABLE, so the client sends the COMMIT that
+		// syncs (RFC 1813 §3.21).
+		if stable == writeUnstable {
+			committed = writeUnstable
+		} else if err := vs.Sync(); err != nil {
+			wccFail(c.Res, StatusIO, before, StatusOK)
+			return rpc.StatusSuccess
+		}
 	}
 	after, afterSt := s.attrFor(e, path)
 	c.Res.Uint32(uint32(StatusOK))
 	encodeWcc(c.Res, before, true, after, afterSt)
 	c.Res.Uint32(uint32(len(data)))
-	c.Res.Uint32(writeFileSync)
+	c.Res.Uint32(committed)
 	c.Res.Fixed(s.writeVerf())
 	return rpc.StatusSuccess
 }
@@ -358,11 +379,15 @@ const (
 // carries the same offset and the same bytes, is the correct recovery.
 //
 // The caller must hold [Server.fsmu].
-func (s *Server) writeAt(e *export, path string, off uint64, data []byte, perm os.FileMode) Status {
+//
+// whole is true when the data went through the whole-file path, which hands the
+// driver a WriteFile and never a Sync: procWrite then syncs the filesystem
+// itself, if it can be.
+func (s *Server) writeAt(e *export, path string, off uint64, data []byte, perm os.FileMode) (st Status, whole bool) {
 	if e.open != nil {
 		f, err := e.openFile(path)
 		if err != nil {
-			return statusFor(err, StatusIO)
+			return statusFor(err, StatusIO), false
 		}
 		if w, ok := f.(WritableFile); ok {
 			// Close's error matters here in a way it does not on the read
@@ -371,30 +396,30 @@ func (s *Server) writeAt(e *export, path string, off uint64, data []byte, perm o
 			// server answer FILE_SYNC for bytes that never landed.
 			if _, err := w.WriteAt(data, int64(off)); err != nil {
 				f.Close()
-				return statusFor(err, StatusIO)
+				return statusFor(err, StatusIO), false
 			}
 			// Sync before Close, so the FILE_SYNC this server always answers
 			// with is a claim the driver has actually been asked to honour.
 			// NFSv3 §3.21 lets a server promise stability only if it can.
 			if err := w.Sync(); err != nil {
 				f.Close()
-				return statusFor(err, StatusIO)
+				return statusFor(err, StatusIO), false
 			}
 			if err := f.Close(); err != nil {
-				return statusFor(err, StatusIO)
+				return statusFor(err, StatusIO), false
 			}
-			return StatusOK
+			return StatusOK, false
 		}
 		// Openable but not writable: fall through to read-modify-write, and
 		// release the handle first so the driver is not asked to serve a
 		// WriteFile on a path it still has open.
 		if err := f.Close(); err != nil {
-			return statusFor(err, StatusIO)
+			return statusFor(err, StatusIO), true
 		}
 	}
 	cur, err := e.fs.ReadFile(path)
 	if err != nil {
-		return statusFor(err, StatusIO)
+		return statusFor(err, StatusIO), true
 	}
 	end := off + uint64(len(data))
 	if end > uint64(len(cur)) {
@@ -406,7 +431,7 @@ func (s *Server) writeAt(e *export, path string, off uint64, data []byte, perm o
 		// is what RFC 1813 gives a write that would make a file larger than
 		// the server can hold.
 		if end-uint64(len(cur)) > fallbackMaxGrowth || end > fallbackMaxSize {
-			return StatusFBig
+			return StatusFBig, true
 		}
 		grown := make([]byte, end)
 		copy(grown, cur)
@@ -414,9 +439,9 @@ func (s *Server) writeAt(e *export, path string, off uint64, data []byte, perm o
 	}
 	copy(cur[off:], data)
 	if err := e.fs.WriteFile(path, cur, perm); err != nil {
-		return statusFor(err, StatusIO)
+		return statusFor(err, StatusIO), true
 	}
-	return StatusOK
+	return StatusOK, true
 }
 
 // createReply encodes the shared tail of CREATE, MKDIR and SYMLINK.
@@ -788,9 +813,19 @@ func (s *Server) procCommit(c *rpc.Call) rpc.Status {
 	}
 	s.fsmu.Lock()
 	a, aSt := s.attrFor(e, path)
+	var syncErr error
+	if vs, ok := e.fs.(volumeSyncer); ok && aSt == StatusOK && s.mayWrite(c, e) {
+		// What an UNSTABLE WRITE left in the driver (see procWrite) goes to the
+		// medium now: a client that was told "committed" must be right.
+		syncErr = vs.Sync()
+	}
 	s.fsmu.Unlock()
 	if aSt != StatusOK {
 		wccFail(c.Res, aSt, fattr{}, aSt)
+		return rpc.StatusSuccess
+	}
+	if syncErr != nil {
+		wccFail(c.Res, StatusIO, a, StatusOK)
 		return rpc.StatusSuccess
 	}
 	c.Res.Uint32(uint32(StatusOK))
