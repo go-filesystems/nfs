@@ -1,6 +1,14 @@
 module github.com/go-filesystems/nfs/fat32demo
 
-go 1.27.3
+// Raised with the root module on 2026-11-15 for GO-2026-6859 (net/http, fixed
+// in 1.27.4); the reasoning is in ../go.mod.
+//
+// ⛔ A NESTED MODULE KEEPS ITS OWN DIRECTIVE, so a raise that stops at the root
+// leaves this one behind and the sweep keeps reporting the repository. Measured
+// the same day: go-fleettools/landingkit had `example` at 1.27.4 and
+// `example-i18n` still at 1.27.3 — two of three modules moved, which reads
+// exactly like finished work in a diff.
+go 1.27.4
 
 require (
 	github.com/go-authn/krb5 v0.3.3
