@@ -11,7 +11,7 @@ module github.com/go-filesystems/nfs/fat32demo
 go 1.27.4
 
 require (
-	github.com/go-authn/krb5 v0.3.4
+	github.com/go-authn/krb5 v0.4.0
 	github.com/go-filesystems/fat32 v0.13.0
 	github.com/go-filesystems/interface v0.6.0
 	github.com/go-filesystems/nfs v0.15.0
@@ -19,7 +19,7 @@ require (
 )
 
 require (
-	github.com/go-filesystems/inflight v0.2.0 // indirect
+	github.com/go-filesystems/inflight v0.5.0 // indirect
 	github.com/go-volumes/gpt v0.3.0 // indirect
 	github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b // indirect
 	github.com/hashicorp/go-uuid v1.0.4 // indirect
