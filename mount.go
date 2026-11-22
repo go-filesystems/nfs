@@ -60,11 +60,7 @@ func (s *Server) procMnt(c *rpc.Call) rpc.Status {
 			return rpc.StatusSuccess
 		}
 	}
-	h, err := s.handles.Handle(e.id, "/")
-	if err != nil {
-		c.Res.Uint32(mountErrInval)
-		return rpc.StatusSuccess
-	}
+	h := s.handles.Handle(e.id, "/")
 	c.Res.Uint32(mountOK)
 	c.Res.Opaque(h)
 	// The auth flavours the client may use.

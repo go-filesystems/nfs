@@ -448,14 +448,10 @@ func (s *Server) writeAt(e *export, path string, off uint64, data []byte, perm o
 func (s *Server) createReply(c *rpc.Call, e *export, dir, full string, before fattr, beforeOK bool) {
 	obj, objSt := s.attrFor(e, full)
 	dirAfter, dirAfterSt := s.attrFor(e, dir)
-	h, err := s.handles.Handle(e.id, full)
+	h := s.handles.Handle(e.id, full)
 	c.Res.Uint32(uint32(StatusOK))
-	if err != nil {
-		c.Res.Bool(false)
-	} else {
-		c.Res.Bool(true)
-		c.Res.Opaque(h)
-	}
+	c.Res.Bool(true)
+	c.Res.Opaque(h)
 	encodePostOp(c.Res, obj, objSt)
 	encodeWcc(c.Res, before, beforeOK, dirAfter, dirAfterSt)
 }

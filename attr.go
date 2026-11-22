@@ -117,11 +117,7 @@ func (s *Server) attrFromStat(e *export, path string, st filesystem.Stat) (fattr
 	// it synthetic and keeps it clear of any real inode number.
 	a.fileid = st.Inode()
 	if a.fileid == 0 {
-		id, err := s.handles.fileID(e.id, path)
-		if err != nil {
-			return fattr{}, StatusServerFault
-		}
-		a.fileid = id
+		a.fileid = s.handles.fileID(e.id, path)
 	}
 
 	// Timestamps. A driver with filesystem.TimesReader gives its own; a Stat

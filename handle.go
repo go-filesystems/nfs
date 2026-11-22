@@ -2,6 +2,7 @@ package nfs
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -88,11 +89,14 @@ import (
 //
 // # Growth
 //
-// Entries are never evicted. Eviction is what would make a valid handle
-// unresolvable under a client that still holds it. The table therefore grows
-// with the number of distinct paths ever looked up, bounded by maxHandles;
-// past that the server answers NFS3ERR_SERVERFAULT rather than forgetting
-// something a client is using.
+// The table holds at most maxHandles paths; past that the least recently used
+// entry is evicted to make room, so a client walking a huge or hostile tree
+// cannot wedge the server into refusing every new path for ever. Eviction is
+// safe because a path id is a keyed hash of the path, never a counter: an
+// evicted handle is not wrong, only unknown, and the next call that presents
+// it takes the [Server.rediscover] route (at most one walk per export per
+// rediscoverInterval) and finds it again if the path still exists. Until then
+// a client holding it may see NFS3ERR_STALE.
 
 // handleSize is the encoded length of a file handle. NFSv3 allows up to 64;
 // 60 is what this layout needs, and a fixed length means a wrong length is
@@ -125,9 +129,6 @@ const maxHandles = 1 << 20
 // unavailable. There is no other way to reach that branch, and it is the one
 // branch where the wrong behaviour is silent.
 var randRead = rand.Read
-
-// errHandleFull reports the path table hitting maxHandles.
-var errHandleFull = errors.New("nfs: file handle table full")
 
 // ErrHandleKey reports a key given to [Server.SetHandleKey] shorter than
 // [HandleKeySize].
@@ -167,9 +168,18 @@ type handleStore struct {
 	// overflow path can be exercised without allocating a million entries.
 	max int
 
+	// mu guards the table and its LRU order. lru's front is the most
+	// recently used entry; every list element's Value is a *handleEntry.
 	mu     sync.Mutex
-	byID   map[pathID]handleKey
-	byPath map[handleKey]pathID
+	byID   map[pathID]*list.Element
+	byPath map[handleKey]*list.Element
+	lru    *list.List
+}
+
+// handleEntry is one table row.
+type handleEntry struct {
+	id pathID
+	k  handleKey
 }
 
 // newHandleStore seeds a store from the system CSPRNG.
@@ -196,8 +206,9 @@ func newHandleStoreWith(key []byte, epoch uint64) *handleStore {
 		key:    bytes.Clone(key),
 		epoch:  epoch,
 		max:    maxHandles,
-		byID:   make(map[pathID]handleKey),
-		byPath: make(map[handleKey]pathID),
+		byID:   make(map[pathID]*list.Element),
+		byPath: make(map[handleKey]*list.Element),
+		lru:    list.New(),
 	}
 }
 
@@ -244,36 +255,38 @@ func (s *handleStore) mac(prefix []byte) []byte {
 
 // learn records a path in the table, so that its handle resolves, and
 // returns its id.
-func (s *handleStore) learn(export uint64, path string) (pathID, error) {
+func (s *handleStore) learn(export uint64, path string) pathID {
 	k := handleKey{export: export, path: path}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if id, ok := s.byPath[k]; ok {
-		return id, nil
+	if el, ok := s.byPath[k]; ok {
+		s.lru.MoveToFront(el)
+		return el.Value.(*handleEntry).id
 	}
-	if len(s.byPath) >= s.max {
-		return pathID{}, errHandleFull
+	// max is at least 1 (see newHandleStoreWith), so Back is never nil here.
+	for len(s.byPath) >= s.max {
+		old := s.lru.Remove(s.lru.Back()).(*handleEntry)
+		delete(s.byPath, old.k)
+		delete(s.byID, old.id)
 	}
 	id := s.idFor(export, path)
-	s.byPath[k] = id
-	s.byID[id] = k
-	return id, nil
+	el := s.lru.PushFront(&handleEntry{id: id, k: k})
+	s.byPath[k] = el
+	s.byID[id] = el
+	return id
 }
 
 // Handle returns the handle naming path within export, recording the path
 // so the handle resolves. The same key, export and path always yield the
 // same bytes, in this Server and in any other holding the key.
-func (s *handleStore) Handle(export uint64, path string) ([]byte, error) {
-	id, err := s.learn(export, path)
-	if err != nil {
-		return nil, err
-	}
+func (s *handleStore) Handle(export uint64, path string) []byte {
+	id := s.learn(export, path)
 	h := make([]byte, handleSize)
 	binary.BigEndian.PutUint32(h[0:4], handleMagic)
 	binary.BigEndian.PutUint64(h[4:12], export)
 	copy(h[12:28], id[:])
 	copy(h[28:], s.mac(h[0:28]))
-	return h, nil
+	return h
 }
 
 // Resolve validates a handle and returns what it names.
@@ -304,11 +317,12 @@ func (s *handleStore) Resolve(h []byte) (k handleKey, stale bool, ok bool) {
 	id := handleID(h)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k, known := s.byID[id]
-	if !known || k.export != export {
+	el, known := s.byID[id]
+	if !known || el.Value.(*handleEntry).k.export != export {
 		return handleKey{export: export}, true, false
 	}
-	return k, false, true
+	s.lru.MoveToFront(el)
+	return el.Value.(*handleEntry).k, false, true
 }
 
 // handleID extracts the path id of a handle Resolve has authenticated.
@@ -322,8 +336,12 @@ func handleID(h []byte) pathID {
 func (s *handleStore) lookupID(id pathID) (handleKey, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k, ok := s.byID[id]
-	return k, ok
+	el, ok := s.byID[id]
+	if !ok {
+		return handleKey{}, false
+	}
+	s.lru.MoveToFront(el)
+	return el.Value.(*handleEntry).k, true
 }
 
 // fileID returns the synthetic fileid for a path (see attr.go): the top bit
@@ -331,12 +349,9 @@ func (s *handleStore) lookupID(id pathID) (handleKey, bool) {
 // same in every Server sharing the key — a client that saw a fileid change
 // under a handle it holds would take the file for a different one. The path
 // is recorded too, as for a handle: a fileid names what a handle would.
-func (s *handleStore) fileID(export uint64, path string) (uint64, error) {
-	id, err := s.learn(export, path)
-	if err != nil {
-		return 0, err
-	}
-	return 1<<63 | binary.BigEndian.Uint64(id[:8])>>1, nil
+func (s *handleStore) fileID(export uint64, path string) uint64 {
+	id := s.learn(export, path)
+	return 1<<63 | binary.BigEndian.Uint64(id[:8])>>1
 }
 
 // rediscoverInterval bounds how often unknown handles may cost a walk of one
@@ -359,6 +374,7 @@ const rediscoverInterval = 10 * time.Second
 // and by rediscoverInterval per export. Only a MAC-valid handle reaches it, so
 // a client cannot trigger it with handles it made up.
 func (s *Server) rediscover(e *export, id pathID) (string, bool) {
+	// Callers must NOT hold fsmu: it is not re-entrant (see fhArg).
 	s.fsmu.Lock()
 	defer s.fsmu.Unlock()
 	// A walk that finished while this call waited for the lock may already
@@ -372,12 +388,11 @@ func (s *Server) rediscover(e *export, id pathID) (string, bool) {
 	}
 	e.lastWalk = now
 	found := ""
-	if got, err := s.handles.learn(e.id, "/"); err != nil {
-		return "", false
-	} else if got == id {
+	if s.handles.learn(e.id, "/") == id {
 		found = "/"
 	}
 	queue := []string{"/"}
+	walked := 1
 	for len(queue) > 0 {
 		dir := queue[0]
 		queue = queue[1:]
@@ -390,12 +405,13 @@ func (s *Server) rediscover(e *export, id pathID) (string, bool) {
 			if st != StatusOK {
 				continue
 			}
-			got, err := s.handles.learn(e.id, full)
-			if err != nil {
-				// The table is full: what has been found is all there is.
+			// The table evicts to make room, so a walk must stop on its own:
+			// after one table's worth of paths, further learning would only
+			// push out what this walk just recorded.
+			if walked++; walked > s.handles.max {
 				return found, found != ""
 			}
-			if got == id {
+			if s.handles.learn(e.id, full) == id {
 				found = full
 			}
 			if fi, err := e.fs.Stat(full); err == nil && fi.Mode()&sIFMT == sIFDIR {

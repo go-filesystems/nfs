@@ -188,12 +188,7 @@ func (s *Server) procLookup(c *rpc.Call) rpc.Status {
 		encodePostOp(c.Res, dirAttr, dirSt)
 		return rpc.StatusSuccess
 	}
-	h, err := s.handles.Handle(e.id, full)
-	if err != nil {
-		c.Res.Uint32(uint32(StatusServerFault))
-		encodePostOp(c.Res, dirAttr, dirSt)
-		return rpc.StatusSuccess
-	}
+	h := s.handles.Handle(e.id, full)
 	c.Res.Uint32(uint32(StatusOK))
 	c.Res.Opaque(h)
 	encodePostOp(c.Res, objAttr, objSt)
@@ -490,6 +485,10 @@ func (s *Server) readdirCommon(c *rpc.Call) (e *export, path string, names []str
 	if err != nil {
 		return nil, "", nil, 0, StatusOK, true
 	}
+	// fsmu is taken only now, AFTER fhArg: fhArg may call rediscover, which
+	// takes fsmu itself, and the lock is not re-entrant. Every non-garbage
+	// return below leaves fsmu held for the caller to release.
+	s.fsmu.Lock()
 	if st != StatusOK {
 		return e, path, nil, 0, st, false
 	}
@@ -540,10 +539,8 @@ func entryPath(dir string, names []string, i int) string {
 
 // READDIR (RFC 1813 §3.16).
 func (s *Server) procReaddir(c *rpc.Call) rpc.Status {
-	s.fsmu.Lock()
 	e, path, names, start, st, garbage := s.readdirCommon(c)
 	if garbage {
-		s.fsmu.Unlock()
 		return rpc.StatusGarbageArgs
 	}
 	count, err := c.Args.Uint32()
@@ -616,10 +613,8 @@ func (s *Server) procReaddir(c *rpc.Call) rpc.Status {
 // to every entry, which is what turns `ls -l` from one round trip per file
 // into one for the whole directory.
 func (s *Server) procReaddirPlus(c *rpc.Call) rpc.Status {
-	s.fsmu.Lock()
 	e, path, names, start, st, garbage := s.readdirCommon(c)
 	if garbage {
-		s.fsmu.Unlock()
 		return rpc.StatusGarbageArgs
 	}
 	dircount, err := c.Args.Uint32()
@@ -668,9 +663,7 @@ func (s *Server) procReaddirPlus(c *rpc.Call) rpc.Status {
 			a, aSt := s.attrFor(e, full)
 			var fh []byte
 			if aSt == StatusOK {
-				if h, err := s.handles.Handle(e.id, full); err == nil {
-					fh = h
-				}
+				fh = s.handles.Handle(e.id, full)
 			}
 			items = append(items, item{
 				name: name, cookie: uint64(i + 1),

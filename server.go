@@ -458,8 +458,6 @@ func statusFor(err error, fallback Status) Status {
 		return StatusInval
 	case errors.Is(err, filesystem.ErrShrinkUnsupported):
 		return StatusNotSupp
-	case errors.Is(err, errHandleFull):
-		return StatusServerFault
 	case errors.Is(err, errQuota):
 		return StatusDQuot
 	case errors.Is(err, errNoSpace):
