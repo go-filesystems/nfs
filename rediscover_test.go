@@ -44,10 +44,7 @@ func twinOf(t *testing.T, fs filesystem.Filesystem, path string) (*Server, *expo
 	a, _ := New()
 	a.Export("/", fs)
 	a.SetHandleKey(key)
-	h, err := a.handles.Handle(a.byPath["/"].id, path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	h := a.handles.Handle(a.byPath["/"].id, path)
 	b, _ := New()
 	b.Export("/", fs)
 	b.SetHandleKey(key)
@@ -97,16 +94,19 @@ func TestRediscoverBranches(t *testing.T) {
 			t.Fatal("a second walk ran inside rediscoverInterval")
 		}
 	})
-	t.Run("table full before the root", func(t *testing.T) {
+	t.Run("walk is bounded by one table", func(t *testing.T) {
 		b, e, id := twinOf(t, tree, "/a")
-		b.handles.max = 0
+		b.handles.max = 1 // only "/" fits: the walk stops before "/a"
 		if _, ok := b.rediscover(e, id); ok {
-			t.Fatal("rediscover with a full table found something")
+			t.Fatal("a walk past the table size found something")
+		}
+		if len(b.handles.byPath) != 1 {
+			t.Fatalf("table = %d entries, want 1", len(b.handles.byPath))
 		}
 	})
 	t.Run("table full mid-walk keeps what it found", func(t *testing.T) {
 		b, e, id := twinOf(t, tree, "/a")
-		b.handles.max = 2 // "/" and "/a", then full
+		b.handles.max = 2 // "/" and "/a"
 		if p, ok := b.rediscover(e, id); !ok || p != "/a" {
 			t.Fatalf("rediscover = (%q, %v)", p, ok)
 		}

@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -89,7 +90,6 @@ func TestStatusFor(t *testing.T) {
 		{"permission", fs.ErrPermission, StatusAccess},
 		{"invalid", fs.ErrInvalid, StatusInval},
 		{"shrink", filesystem.ErrShrinkUnsupported, StatusNotSupp},
-		{"handle full", errHandleFull, StatusServerFault},
 		{"text not found", errors.New(`fat32: "/x" not found`), StatusNoEnt},
 		{"text no such", errors.New("no such file"), StatusNoEnt},
 		{"text does not exist", errors.New("it does not exist"), StatusNoEnt},
@@ -117,18 +117,15 @@ func TestHandleStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newHandleStore: %v", err)
 	}
-	h1, err := s.Handle(1, "/a")
-	if err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
+	h1 := s.Handle(1, "/a")
 	if len(h1) != handleSize {
 		t.Fatalf("handle length = %d, want %d", len(h1), handleSize)
 	}
-	h2, _ := s.Handle(1, "/a")
+	h2 := s.Handle(1, "/a")
 	if string(h1) != string(h2) {
 		t.Fatal("the same path minted two different handles")
 	}
-	h3, _ := s.Handle(2, "/a")
+	h3 := s.Handle(2, "/a")
 	if string(h1) == string(h3) {
 		t.Fatal("the same path in two exports minted the same handle")
 	}
@@ -154,7 +151,7 @@ func indexOf(hay, needle []byte) int {
 
 func TestHandleStoreRejects(t *testing.T) {
 	s, _ := newHandleStore()
-	good, _ := s.Handle(1, "/a")
+	good := s.Handle(1, "/a")
 
 	t.Run("wrong length", func(t *testing.T) {
 		if _, _, ok := s.Resolve(good[:handleSize-1]); ok {
@@ -179,7 +176,7 @@ func TestHandleStoreRejects(t *testing.T) {
 	})
 	t.Run("another key", func(t *testing.T) {
 		other, _ := newHandleStore()
-		h, _ := other.Handle(1, "/a")
+		h := other.Handle(1, "/a")
 		if _, stale, ok := s.Resolve(h); ok || stale {
 			t.Fatalf("a handle under another key: stale=%v ok=%v, want BADHANDLE", stale, ok)
 		}
@@ -188,7 +185,7 @@ func TestHandleStoreRejects(t *testing.T) {
 		// Authentic but unknown: stale, with the export named so the server
 		// can look for the path.
 		twin := newHandleStoreWith(s.key, 0)
-		h, _ := twin.Handle(7, "/elsewhere")
+		h := twin.Handle(7, "/elsewhere")
 		k, stale, ok := s.Resolve(h)
 		if ok || !stale || k.export != 7 {
 			t.Fatalf("an unknown authentic handle = (%+v, stale=%v, ok=%v)", k, stale, ok)
@@ -199,22 +196,55 @@ func TestHandleStoreRejects(t *testing.T) {
 func TestHandleStoreFull(t *testing.T) {
 	s, _ := newHandleStore()
 	s.max = 2
-	if _, err := s.Handle(1, "/a"); err != nil {
-		t.Fatalf("first Handle: %v", err)
+	s.Handle(1, "/a")
+	s.Handle(1, "/b")
+	// Touch /a so /b is the least recently used, then overflow with /c.
+	ha := s.Handle(1, "/a")
+	hc := s.Handle(1, "/c")
+	if n := len(s.byPath); n != 2 || len(s.byID) != 2 || s.lru.Len() != 2 {
+		t.Fatalf("table size = %d/%d/%d, want 2", n, len(s.byID), s.lru.Len())
 	}
-	if _, err := s.Handle(1, "/b"); err != nil {
-		t.Fatalf("second Handle: %v", err)
+	if _, _, ok := s.Resolve(ha); !ok {
+		t.Fatal("recently used /a was evicted")
 	}
-	if _, err := s.Handle(1, "/c"); !errors.Is(err, errHandleFull) {
-		t.Fatalf("third Handle error = %v, want errHandleFull", err)
+	if _, _, ok := s.Resolve(hc); !ok {
+		t.Fatal("new /c does not resolve")
 	}
-	// An already-known path still resolves once the table is full: the
-	// server degrades for new paths, it does not break existing mounts.
-	if _, err := s.Handle(1, "/a"); err != nil {
-		t.Fatalf("known path after overflow: %v", err)
+	hb := newHandleStoreWith(s.key, 0).Handle(1, "/b")
+	if _, stale, ok := s.Resolve(hb); ok || !stale {
+		t.Fatalf("evicted /b: stale=%v ok=%v, want stale (recoverable by rediscover)", stale, ok)
 	}
-	if _, err := s.fileID(1, "/c"); !errors.Is(err, errHandleFull) {
-		t.Fatalf("fileID after overflow = %v, want errHandleFull", err)
+	// Handing /b out again re-learns it (evicting the new LRU) with the
+	// same id: an evicted handle is unknown, never different.
+	if h2 := s.Handle(1, "/b"); !bytes.Equal(h2, hb) {
+		t.Fatal("re-learned /b differs")
+	}
+	s.fileID(1, "/d")
+	if len(s.byPath) != 2 {
+		t.Fatalf("table grew past its cap: %d", len(s.byPath))
+	}
+}
+
+func TestHandleStoreLookupAndDuplicates(t *testing.T) {
+	s, _ := newHandleStore()
+	if _, ok := s.lookupID(pathID{1}); ok {
+		t.Fatal("lookupID found an id nobody learned")
+	}
+	id := s.learn(1, "/a")
+	if id2 := s.learn(1, "/a"); id2 != id || len(s.byPath) != 1 || len(s.byID) != 1 || s.lru.Len() != 1 {
+		t.Fatalf("relearning a path grew the table: %d/%d/%d", len(s.byPath), len(s.byID), s.lru.Len())
+	}
+	if k, ok := s.lookupID(id); !ok || k.path != "/a" || k.export != 1 {
+		t.Fatalf("lookupID = (%+v, %v)", k, ok)
+	}
+	// A MAC-valid handle carrying a known id under another export is stale,
+	// not a hit: the id alone does not name the entry.
+	h := s.Handle(1, "/a")
+	forged := bytes.Clone(h)
+	forged[11] = 2 // export 2
+	copy(forged[28:], s.mac(forged[0:28]))
+	if _, stale, ok := s.Resolve(forged); ok || !stale {
+		t.Fatalf("known id under the wrong export: stale=%v ok=%v", stale, ok)
 	}
 }
 
@@ -392,16 +422,18 @@ func TestAttrUsesDriverModTime(t *testing.T) {
 	_ = time.Now
 }
 
-// TestAttrSyntheticFileIDOverflow covers the branch where a zero inode needs a
-// synthetic fileid but the handle table is full.
+// TestAttrSyntheticFileIDOverflow: a zero inode needs a synthetic fileid, and
+// a full handle table evicts to provide it instead of failing.
 func TestAttrSyntheticFileIDOverflow(t *testing.T) {
 	s, _ := New()
 	if err := s.Export("/", zeroInodeFS{}); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
-	s.handles.max = 0
-	if _, st := s.attrFor(s.byPath["/"], "/f"); st != StatusServerFault {
-		t.Fatalf("attrFor with a full handle table = %v, want SERVERFAULT", st)
+	s.handles.max = 1
+	s.handles.Handle(s.byPath["/"].id, "/other")
+	a, st := s.attrFor(s.byPath["/"], "/f")
+	if st != StatusOK || a.fileid>>63 != 1 {
+		t.Fatalf("attrFor with a full handle table = %v fileid %x, want OK, synthetic", st, a.fileid)
 	}
 }
 
@@ -498,10 +530,7 @@ func newTestServer(t *testing.T) (*Server, []byte) {
 	if err := s.Export("/", nopFS{}); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
-	h, err := s.handles.Handle(s.byPath["/"].id, "/")
-	if err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
+	h := s.handles.Handle(s.byPath["/"].id, "/")
 	return s, h
 }
 
@@ -512,7 +541,7 @@ func newTestServer(t *testing.T) (*Server, []byte) {
 func TestStaleHandleAfterRestart(t *testing.T) {
 	s, _ := newTestServer(t)
 	twin := newHandleStoreWith(s.handles.key, 0)
-	gone, _ := twin.Handle(s.byPath["/"].id, "/gone")
+	gone := twin.Handle(s.byPath["/"].id, "/gone")
 	st, d := invoke(s.procGetAttr, fhArgs(gone))
 	if st != rpc.StatusSuccess {
 		t.Fatalf("GETATTR: rpc status %v", st)
@@ -544,12 +573,11 @@ func TestHandleForAVanishedExport(t *testing.T) {
 	}
 }
 
-// TestHandleTableFullDegradesGracefully: once the table is full the server
-// must answer, not evict a handle a client is still using.
-func TestHandleTableFullDegradesGracefully(t *testing.T) {
+// TestHandleTableFullEvictsAndRediscovers: with the table at its cap the server
+// keeps minting handles (MNT, CREATE), and a handle it evicted is recovered by
+// rediscover rather than refused for ever.
+func TestHandleTableFullEvictsAndRediscovers(t *testing.T) {
 	t.Run("MNT", func(t *testing.T) {
-		// A fresh server: the root handle must not already be in the table,
-		// or MNT would find it rather than try to mint it.
 		s, err := New()
 		if err != nil {
 			t.Fatalf("New: %v", err)
@@ -557,24 +585,13 @@ func TestHandleTableFullDegradesGracefully(t *testing.T) {
 		if err := s.Export("/", nopFS{}); err != nil {
 			t.Fatalf("Export: %v", err)
 		}
-		s.handles.max = 0
+		s.handles.max = 1
+		s.handles.learn(s.byPath["/"].id, "/other")
 		e := xdr.NewEncoder(nil)
 		e.String("/")
 		_, d := invoke(s.procMnt, e.Bytes())
-		if got, _ := d.Uint32(); got != mountErrInval {
-			t.Fatalf("MNT with a full handle table = %d, want MNT3ERR_INVAL", got)
-		}
-	})
-	t.Run("LOOKUP", func(t *testing.T) {
-		s, h := newTestServer(t)
-		s.handles.max = 1
-		e := xdr.NewEncoder(nil)
-		e.Opaque(h)
-		e.String("x")
-		_, d := invoke(s.procLookup, e.Bytes())
-		got, _ := d.Uint32()
-		if Status(got) != StatusServerFault {
-			t.Fatalf("LOOKUP with a full handle table = %v, want SERVERFAULT", Status(got))
+		if got, _ := d.Uint32(); got != mountOK {
+			t.Fatalf("MNT with a full handle table = %d, want OK", got)
 		}
 	})
 	t.Run("CREATE", func(t *testing.T) {
@@ -593,10 +610,24 @@ func TestHandleTableFullDegradesGracefully(t *testing.T) {
 		_, d := invoke(s.procCreate, e.Bytes())
 		got, _ := d.Uint32()
 		if Status(got) != StatusOK {
-			t.Fatalf("CREATE with a full handle table = %v, want OK with no handle", Status(got))
+			t.Fatalf("CREATE with a full handle table = %v, want OK", Status(got))
 		}
-		if hasFH, _ := d.Uint32(); hasFH != 0 {
-			t.Fatal("CREATE returned a handle it could not mint")
+		if hasFH, _ := d.Uint32(); hasFH != 1 {
+			t.Fatal("CREATE did not return a handle")
+		}
+	})
+	t.Run("evicted handle is rediscovered", func(t *testing.T) {
+		s, h := newTestServer(t)
+		root := s.byPath["/"]
+		// Evict the root handle's entry by filling the (size 1) table.
+		s.handles.max = 1
+		s.handles.learn(root.id, "/elsewhere")
+		if _, stale, ok := s.handles.Resolve(h); ok || !stale {
+			t.Fatalf("root handle after eviction: stale=%v ok=%v", stale, ok)
+		}
+		_, d := invoke(s.procGetAttr, fhArgs(h))
+		if got, _ := d.Uint32(); Status(got) != StatusOK {
+			t.Fatalf("GETATTR on an evicted handle = %v, want OK via rediscover", Status(got))
 		}
 	})
 }

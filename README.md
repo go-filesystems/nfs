@@ -143,11 +143,14 @@ is documented rather than merely implemented. A handle is 60 bytes:
   restart with zero risk of a stale handle resolving to the wrong file. A
   persistent variant (stable key plus a table checkpoint) fits the same 60
   bytes without a format change.
-- **Slots are never recycled.** Recycling is what would make a stale handle
-  *dangerous* rather than merely stale, and an LRU would silently invalidate
-  handles a client still holds. The table grows with the number of distinct
-  paths looked up, bounded by 2²⁰; past that the server answers
-  `NFS3ERR_SERVERFAULT` rather than evicting something in use.
+- **The handle table is bounded, with LRU eviction.** It holds at most 2²⁰
+  paths; past that the least recently used entry is dropped, so a client
+  walking a huge tree cannot make the server refuse every new path for ever.
+  A path id is a keyed hash of the path, never a counter, so an evicted handle
+  can never resolve to a different file: it is only unknown, and the next call
+  that presents it triggers a rediscovery walk of the export (at most one per
+  export per 10 s) that finds it again if the path still exists. Until then a
+  client holding it may see `NFS3ERR_STALE`.
 
 ## Performance, and the two gaps in the contract
 
