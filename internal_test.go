@@ -225,6 +225,29 @@ func TestHandleStoreFull(t *testing.T) {
 	}
 }
 
+func TestHandleStoreLookupAndDuplicates(t *testing.T) {
+	s, _ := newHandleStore()
+	if _, ok := s.lookupID(pathID{1}); ok {
+		t.Fatal("lookupID found an id nobody learned")
+	}
+	id := s.learn(1, "/a")
+	if id2 := s.learn(1, "/a"); id2 != id || len(s.byPath) != 1 || len(s.byID) != 1 || s.lru.Len() != 1 {
+		t.Fatalf("relearning a path grew the table: %d/%d/%d", len(s.byPath), len(s.byID), s.lru.Len())
+	}
+	if k, ok := s.lookupID(id); !ok || k.path != "/a" || k.export != 1 {
+		t.Fatalf("lookupID = (%+v, %v)", k, ok)
+	}
+	// A MAC-valid handle carrying a known id under another export is stale,
+	// not a hit: the id alone does not name the entry.
+	h := s.Handle(1, "/a")
+	forged := bytes.Clone(h)
+	forged[11] = 2 // export 2
+	copy(forged[28:], s.mac(forged[0:28]))
+	if _, stale, ok := s.Resolve(forged); ok || !stale {
+		t.Fatalf("known id under the wrong export: stale=%v ok=%v", stale, ok)
+	}
+}
+
 func TestNewHandleStoreCSPRNGFailure(t *testing.T) {
 	orig := randRead
 	t.Cleanup(func() { randRead = orig })
